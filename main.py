@@ -68,7 +68,7 @@ EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 # fails or returns an empty result, the secondary provider (if configured) will
 # be tried as a fallback.
 PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "gemini").lower()
-SECONDARY_PROVIDER = os.getenv("SECONDARY_PROVIDER", "").lower()
+SECONDARY_PROVIDER = os.getenv("SECONDARY_PROVIDER", "openrouter").lower()
 
 # DeepSeek configuration (optional)
 DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
