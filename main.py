@@ -250,6 +250,31 @@ def generate_response(user_id: str, user_input: str) -> str:
 
 
 # =========================
+# Kakao response helper
+# =========================
+def build_kakao_response(message: str) -> dict:
+    """
+    Construct a response payload conforming to Kakao i 오픈빌더 스킬 서버 JSON 형식.
+
+    According to the Kakao chatbot documentation, a response must include
+    ``version`` and a ``template.outputs`` array with at least one component
+    such as ``simpleText`` specifying the text to send【295018986661562†screenshot】.
+    """
+    return {
+        "version": "2.0",
+        "template": {
+            "outputs": [
+                {
+                    "simpleText": {
+                        "text": message
+                    }
+                }
+            ]
+        }
+    }
+
+
+# =========================
 # 웹훅 전송 (비동기 - 핵심!)
 # =========================
 async def send_webhook_response(webhook_url: str, response_data: dict, retries: int = 0):
@@ -440,11 +465,16 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
                     webhook_url,
                     {"reply": cached, "user_id": user_id}
                 )
-                # KakaoTalk expects a single reply; return the cached answer
-                # immediately so the user sees a response. No separate status field.
-                return {"reply": cached}
+                # Return the cached answer to Kakao in the required JSON format.
+                payload = build_kakao_response(cached)
+                # Also include a top-level 'text' field for custom clients that
+                # expect just a plain text response.
+                payload["text"] = cached
+                return payload
             else:
-                return {"reply": cached}
+                payload = build_kakao_response(cached)
+                payload["text"] = cached
+                return payload
 
         # If a webhook is provided, generate response asynchronously and defer delivery
         if webhook_url:
@@ -456,7 +486,10 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
                 cache_key
             )
             # 카카오채널은 단 한 번의 메시지만 전송할 수 있으므로 즉시 안내 메시지를 반환
-            return {"reply": "답변을 생성 중입니다. 잠시만 기다려 주세요."}
+            message_for_user = "답변을 생성 중입니다. 잠시만 기다려 주세요."
+            payload = build_kakao_response(message_for_user)
+            payload["text"] = message_for_user
+            return payload
 
         # Otherwise generate a reply immediately
         response = await asyncio.get_event_loop().run_in_executor(
@@ -470,7 +503,9 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
         if response:
             cache.set(cache_key, response)
         
-        return {"reply": response}
+        payload = build_kakao_response(response)
+        payload["text"] = response
+        return payload
         
     except Exception as e:
         logger.error(f"카카오 브릿지 오류: {e}")
