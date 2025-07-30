@@ -26,7 +26,7 @@ import redis
 # Environment & Constants
 # =========================
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 
 CHAR_NAME      = os.getenv("CHAR_NAME", "마릴라이트")
