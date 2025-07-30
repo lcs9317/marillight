@@ -85,7 +85,7 @@ from chromadb.config import Settings
 # Environment & Constants
 # =========================
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 
 # Provider configuration
@@ -174,82 +174,198 @@ memory = ConversationMemory()
 # =========================
 def parse_character_file(path: str) -> Dict[str, Any]:
     """
-    Parse a character file into a structured dictionary. The file must
-    contain at least three lines (name, style, background). Lines beyond
-    the third line are considered part of the lore unless a recognised
-    section header is encountered. Supported section headers (case
-    insensitive, surrounded by square brackets) include '추억'/'Memories',
-    '인물'/'Characters', '관계도'/'Relationships' and '스토리'/'Story'.
+    Parse a character file into a structured dictionary. This parser
+    supports two families of file layouts:
 
-    Returns a dictionary with keys:
+      1. **Simple format** – At least four lines: name, style, background and
+         lore. Lines beyond the third line are treated as lore unless a
+         recognised section header is encountered (see below).
 
-      * name: str
-      * style: str
-      * background: str
-      * lore: str
+      2. **Rich format** – A YAML‑like key/value header followed by
+         multiple sections denoted by ``[제목]``. For example:
+
+           이름: 마릴라이트
+           소속(문명): 아스니아
+           클래스: 서포터
+           ...
+
+           ---
+
+           [캐릭터 소개]
+           ...
+
+           [성격 및 말투]
+           ...
+
+         Lines before the first ``[Section]`` are parsed as key/value
+         metadata. ``---`` lines are ignored and simply separate
+         sections. Recognised section names (case insensitive) are
+         mapped onto internal fields:
+
+             * '캐릭터 소개'   → 'introduction'
+             * '성격 및 말투' → 'style'
+             * '성격'/'말투' → 'style'
+             * '스토리 주요 행적' → 'story'
+             * '스토리'       → 'story'
+             * '인간관계'     → 'relationships'
+             * '관계도'       → 'relationships'
+             * '추억'/'Memories' → 'memories'
+             * '인물'/'Characters' → 'characters'
+             * '챗봇 인식 키워드' → 'keywords'
+
+         Unrecognised section names are stored verbatim in ``extra``.
+
+    Returns a dictionary with the following keys (always present):
+
+      * name: str – The character's name (from ``이름`` field or first
+        non‑empty line).
+      * style: str – The core style/personality, derived from the
+        '성격 및 말투' or second line in the simple format.
+      * background: str – Concatenation of affiliation/class/intro.
+      * lore: str – The free‑form lore/introduction text.
       * memories: List[str]
       * characters: List[str]
       * relationships: List[str]
       * story: str
+      * keywords: List[str]
+      * meta: Dict[str, str] – All header key/value pairs for reference.
+      * extra: Dict[str, List[str]] – Unrecognised sections.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
-            lines = [line.rstrip("\n") for line in f]
+            raw_lines = [line.rstrip("\n") for line in f]
     except Exception as e:
         raise RuntimeError(f"Failed to read character file {path}: {e}")
 
-    # Pad missing lines to avoid index errors
-    while len(lines) < 4:
-        lines.append("")
+    # Preprocess lines: remove BOM and normalise whitespace
+    lines: List[str] = []
+    for line in raw_lines:
+        if line.lstrip().startswith("\ufeff"):
+            line = line.lstrip("\ufeff")
+        lines.append(line)
 
-    name        = lines[0].strip()
-    style       = lines[1].strip()
-    background  = lines[2].strip()
-    # Default values for optional fields
-    lore_lines: List[str]           = []
-    memories: List[str]            = []
-    characters: List[str]          = []
-    relationships: List[str]       = []
-    story_lines: List[str]         = []
-
-    # Mapping of section headers to internal keys
-    header_map = {
+    # Recognised section name mapping
+    section_map = {
+        "캐릭터 소개": "introduction",
+        "introduction": "introduction",
+        "성격 및 말투": "style",
+        "성격": "style",
+        "말투": "style",
+        "성격 및 말투": "style",
+        "스토리 주요 행적": "story",
+        "스토리": "story",
+        "이야기": "story",
+        "인간관계": "relationships",
+        "관계도": "relationships",
+        "관계": "relationships",
         "추억": "memories",
         "memories": "memories",
         "인물": "characters",
         "characters": "characters",
-        "관계도": "relationships",
-        "relationships": "relationships",
-        "스토리": "story",
-        "story": "story",
+        "챗봇 인식 키워드": "keywords",
+        "keywords": "keywords",
     }
 
-    current_section = "lore"  # by default, lines after the first three belong to lore
-    section_buffers = {
-        "lore": [],
+    # Initialise storage
+    metadata: Dict[str, str] = {}
+    sections: Dict[str, List[str]] = {
+        "introduction": [],
+        "style": [],
+        "story": [],
+        "relationships": [],
         "memories": [],
         "characters": [],
-        "relationships": [],
-        "story": [],
+        "keywords": [],
     }
+    extra_sections: Dict[str, List[str]] = {}
 
-    for line in lines[3:]:
+    current_section: Optional[str] = None
+    # Flag indicating that we have started reading sections. Before we
+    # encounter a recognised [Section] heading, lines are treated as
+    # metadata (unless using the simple format fallback).
+    for line in lines:
         stripped = line.strip()
-        # Detect a new section header
+        # Skip blank lines and separators
+        if stripped == "" or stripped == "---":
+            continue
+        # Detect section header in square brackets
         if stripped.startswith("[") and stripped.endswith("]"):
-            header = stripped[1:-1].strip().lower()
-            if header in header_map:
-                current_section = header_map[header]
+            header = stripped[1:-1].strip()
+            key_lower = header.lower()
+            mapped = section_map.get(header, section_map.get(key_lower))
+            if mapped:
+                current_section = mapped
                 continue
-        # Append to the current section buffer
-        section_buffers[current_section].append(stripped)
+            else:
+                # Unknown section, preserve its name
+                current_section = header
+                extra_sections.setdefault(header, [])
+                continue
+        # Process line according to current state
+        if current_section is None:
+            # Parse key:value pairs until we hit a section header
+            if ":" in stripped:
+                meta_key, meta_val = stripped.split(":", 1)
+                metadata[meta_key.strip()] = meta_val.strip()
+            else:
+                # No colon implies this might be a stray introduction line
+                sections["introduction"].append(stripped)
+        else:
+            # Append line to the current section buffer
+            if current_section in sections:
+                sections[current_section].append(stripped)
+            else:
+                extra_sections.setdefault(current_section, []).append(stripped)
 
-    # Join lists into strings where appropriate
-    lore        = "\n".join(filter(None, section_buffers["lore"])).strip()
-    story       = "\n".join(filter(None, section_buffers["story"])).strip()
-    memories    = [m for m in section_buffers["memories"] if m]
-    characters  = [c for c in section_buffers["characters"] if c]
-    relationships = [r for r in section_buffers["relationships"] if r]
+    # Determine the character's name
+    name = metadata.get("이름") or metadata.get("name")
+    if not name:
+        # Fallback to first non‑empty line in metadata or lines list
+        for candidate in metadata.values():
+            if candidate:
+                name = candidate
+                break
+        if not name:
+            for l in lines:
+                if l.strip():
+                    name = l.strip()
+                    break
+    name = name.strip() if name else ""
+
+    # Derive core style: combine bullet list or paragraphs
+    style_lines = sections.get("style", [])
+    style = " ".join([line.lstrip("- ") for line in style_lines]).strip()
+    # If no style section exists and simple format may apply
+    if not style and len(lines) >= 2 and metadata == {}:
+        style = lines[1].strip()
+
+    # Build background: include affiliation/class/etc. plus introduction
+    background_parts: List[str] = []
+    # Common metadata fields to include
+    for key in ["소속(문명)", "소속", "클래스", "신장", "생일", "좋아하는 것", "싫어하는 것", "birth", "affiliation", "class"]:
+        if key in metadata:
+            background_parts.append(f"{key}: {metadata[key]}")
+    # Append introduction section
+    intro_str = "\n".join(sections.get("introduction", [])).strip()
+    if intro_str:
+        background_parts.append(intro_str)
+    background = "\n".join(background_parts).strip()
+    # Fallback to third line in simple format if still empty
+    if not background and len(lines) >= 3 and metadata == {}:
+        background = lines[2].strip()
+
+    # Combine lore: introduction or free‑form lore not captured elsewhere
+    lore = intro_str
+    # Compose story
+    story = "\n".join(sections.get("story", [])).strip()
+    # Relationships
+    relationships = [line.lstrip("- ") for line in sections.get("relationships", []) if line]
+    # Memories
+    memories = [line.lstrip("- ") for line in sections.get("memories", []) if line]
+    # Characters
+    characters = [line.lstrip("- ") for line in sections.get("characters", []) if line]
+    # Keywords
+    keywords = [line.lstrip("- ") for line in sections.get("keywords", []) if line]
 
     return {
         "name": name,
@@ -260,6 +376,9 @@ def parse_character_file(path: str) -> Dict[str, Any]:
         "characters": characters,
         "relationships": relationships,
         "story": story,
+        "keywords": keywords,
+        "meta": metadata,
+        "extra": extra_sections,
     }
 
 
@@ -289,38 +408,60 @@ def load_characters(dir_path: str) -> Dict[str, Dict[str, Any]]:
 def build_lore_for_character(target_name: str, characters: Dict[str, Dict[str, Any]]) -> str:
     """
     Construct a combined lore string for the given character. The lore
-    includes the character's own lore, story, relationships and
-    memories. Additionally, memories from other characters that mention
-    ``target_name`` are appended. This ensures shared experiences are
-    available during context retrieval without blending personalities.
+    includes the character's own introduction, story, relationships,
+    memories, keywords and any other relevant sections. Additionally,
+    narrative snippets from other characters that mention ``target_name``
+    are appended. This ensures shared experiences are available during
+    context retrieval without blending personalities.
     """
     if target_name not in characters:
         raise ValueError(f"Character {target_name} not found")
     char = characters[target_name]
     parts: List[str] = []
-    # Core lore
-    if char["lore"]:
+    # Append introduction/lore
+    if char.get("lore"):
         parts.append(char["lore"])
+    # Append background to give context about affiliation/class/etc.
+    if char.get("background"):
+        parts.append(f"[배경]\n{char['background']}")
     # Append story
-    if char["story"]:
+    if char.get("story"):
         parts.append(f"[스토리]\n{char['story']}")
     # Append relationships
-    if char["relationships"]:
-        parts.append("[관계도]\n" + "\n".join(char["relationships"]))
-    # Append list of other characters for reference
-    if char["characters"]:
-        parts.append("[인물]\n" + "\n".join(char["characters"]))
+    if char.get("relationships"):
+        parts.append("[인간관계]\n" + "\n".join(char["relationships"]))
+    # Append characters list
+    if char.get("characters"):
+        parts.append("[관련 인물]\n" + "\n".join(char["characters"]))
     # Append own memories
-    if char["memories"]:
+    if char.get("memories"):
         parts.append("[추억]\n" + "\n".join(char["memories"]))
-    # Append memories from others mentioning this character
+    # Append keywords
+    if char.get("keywords"):
+        parts.append("[키워드]\n" + "\n".join(char["keywords"]))
+    # Append snippets from other characters referencing this character
     for other_name, other in characters.items():
         if other_name == target_name:
             continue
-        for mem in other.get("memories", []):
-            if target_name in mem:
-                parts.append(f"[추억] ({other_name}) {mem}")
-    return "\n\n".join(parts).strip()
+        # Gather lines from various sections that contain the target name
+        cross_lines: List[str] = []
+        # Check other character's memories, relationships, story, lore, introduction, keywords
+        for section_key in ["memories", "relationships", "story", "lore", "background", "keywords", "characters"]:
+            section_val = other.get(section_key)
+            if not section_val:
+                continue
+            if isinstance(section_val, list):
+                for line in section_val:
+                    if target_name in line:
+                        cross_lines.append(line)
+            elif isinstance(section_val, str):
+                # Split long strings into sentences or lines to find target
+                for segment in section_val.split("\n"):
+                    if target_name in segment:
+                        cross_lines.append(segment.strip())
+        if cross_lines:
+            parts.append(f"[타인 추억] ({other_name})\n" + "\n".join(cross_lines))
+    return "\n\n".join([p for p in parts if p]).strip()
 
 
 # Load all characters at startup
@@ -330,11 +471,28 @@ except Exception as e:
     raise RuntimeError(f"Character loading failed: {e}")
 
 # Determine active character name
+# Priority:
+#   1. Environment variable CURRENT_CHARACTER (exact match)
+#   2. A character named 'Marillight' or '마릴라이트' (case insensitive)
+#   3. The first character in the loaded set
 if CURRENT_CHARACTER and CURRENT_CHARACTER in CHARACTERS:
     ACTIVE_NAME = CURRENT_CHARACTER
 else:
-    # Default to first character in alphabetical order
-    ACTIVE_NAME = next(iter(CHARACTERS))
+    # Try to find a character named Marillight (either English or Korean)
+    preferred_names = ["marillight", "마릴라이트"]
+    found_preferred: Optional[str] = None
+    for pn in preferred_names:
+        for key in CHARACTERS.keys():
+            if key.lower() == pn:
+                found_preferred = key
+                break
+        if found_preferred:
+            break
+    if found_preferred:
+        ACTIVE_NAME = found_preferred
+    else:
+        # Fallback to first character in alphabetical order
+        ACTIVE_NAME = next(iter(CHARACTERS))
 
 # Extract basic metadata for the active character
 active_char = CHARACTERS[ACTIVE_NAME]
