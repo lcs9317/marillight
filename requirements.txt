@@ -1,7 +1,7 @@
 fastapi>=0.111.1
 uvicorn[standard]>=0.30.3
+orjson>=3.10.7
 google-generativeai>=0.7.2
 chromadb>=0.5.5
 redis>=5.0.7
-python-dotenv>=1.0.1
-orjson>=3.10.7
+httpx>=0.24.0
