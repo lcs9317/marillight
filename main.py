@@ -577,8 +577,9 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
         body = await request.body()
         data = orjson.loads(body) if body else {}
         
-        user_id = data.get("user_key", "kakao_user")
-        message = data.get("content", "").strip()
+        # 기존 키(room, text)와 새로운 키(user_key, content) 모두 허용
+        user_id  = data.get("user_key") or data.get("room") or "kakao_user"
+        message  = data.get("content") or data.get("text") or ""
         webhook_url = data.get("webhook_url")
         
         if not message:
