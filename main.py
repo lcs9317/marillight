@@ -2,7 +2,7 @@ import os
 import hashlib
 import time
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
@@ -13,36 +13,65 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 """
-This file exposes a simple chatbot service built on top of Google’s Gemini API.
+This module extends the original single‑character chatbot to support
+multiple characters, shared memories and richer world‑building. Each
+character is defined by a text file in a designated folder. A file can
+include a basic description (name, style, background and lore) as well
+as optional sections for memories, other characters, relationships and
+story arcs. On startup all files are parsed and loaded into memory.
 
-It uses FastAPI to expose a handful of endpoints that can be used by different
-front‑end clients. The primary consumer in this scenario is KakaoTalk via the
-``/kakao‑bridge`` route. Incoming messages are processed through an in‑memory
-conversation store, relevant context is retrieved from a vector database (if
-configured), and a response is generated via the Gemini model.
+The running character (the one the assistant will role‑play as) is
+selected via the ``CURRENT_CHARACTER`` environment variable. If not
+specified, the first file found is used. The assistant's system prompt
+uses that character's name, style and background, while the vector
+database is initialised with a composite lore built from the chosen
+character's own lore plus any memories from other characters that
+mention them. This allows the chatbot to recall shared experiences
+without confusing personalities.
 
-Key improvements compared to the initial version:
+File format
+-----------
 
-* Robust handling of blank or placeholder responses. Previously, the
-  underlying model could return an empty string or the literal marker
-  ``"(빈 응답)"``. To avoid confusing the end user with an empty reply,
-  ``generate_response`` now normalises such cases to a friendly fallback
-  message. Downstream callers no longer need to worry about filtering
-  `(빈 응답)` explicitly.
+Each ``*.txt`` file in the ``CHARACTER_DIR`` should be encoded in
+UTF‑8 and organised as follows:
 
-* Additional guard logic in the Kakao bridge route ensures that even if a
-  blank string slips through from the model, the user still receives a
-  meaningful message. This helps maintain a consistent conversation flow on
-  platforms like KakaoTalk where immediate feedback is important.
+    1. The character's name on the first line.
+    2. A comma‑separated list of adjectives describing the core style.
+    3. A brief background description.
+    4. A free‑form lore section. If no other sections are provided,
+       everything from the fourth line onwards is considered lore.
 
-* The synchronous ``generate_response`` remains unchanged in its design—by
-  default it runs in a thread pool when called from an async endpoint. If
-  you choose to call it directly (i.e., without ``run_in_executor``), ensure
-  that your FastAPI route is declared with ``async def`` and that blocking
-  operations will not starve the event loop.
+Additional sections can be declared using headers in either Korean or
+English. Recognised headers are:
 
-To run this service you need to set the ``GOOGLE_API_KEY`` environment
-variable. Consult the README for further configuration instructions.
+    [추억] or [Memories]          – one memory per line describing past events.
+    [인물] or [Characters]        – one line per other character mentioned.
+    [관계도] or [Relationships]    – one line describing a relationship.
+    [스토리] or [Story]             – one or more lines describing story arcs.
+
+Sections end when another header is encountered or the file ends. Lines
+belonging to a section are trimmed but otherwise preserved. Characters
+are case‑insensitive for header detection.
+
+Example ``Marillite.txt`` file:
+
+    마릴라이트
+    온화하고 시적인, 애정 어린, 섬세한
+    아스니아 출신의 천재 가수로, 그녀의 목소리는 마법처럼 청중을 사로잡는다.
+    마릴라이트는 작은 마을에서 태어났지만, 음악에 대한 열정으로 세계적인
+    가수가 되었다. 그녀의 노래는 슬픔과 희망을 동시에 담고 있다.
+    [추억]
+    아이렌과 함께 어린 시절 아스니아의 수확 축제에서 노래를 부른 기억이 있다.
+    [인물]
+    아이렌 – 마릴라이트의 절친.
+    [관계도]
+    아이렌: 마릴라이트의 친구이자 동료. 서로에 대한 깊은 신뢰를 가지고 있다.
+    [스토리]
+    마릴라이트는 세계 투어를 준비하며 아이렌과 다시 만나 팀을 결성한다.
+
+This richer structure enables the assistant to recall shared memories
+when appropriate and to maintain consistent characterisation across
+multiple personas.
 """
 
 # ── Google Gemini ─────────────────────────────────────────
@@ -52,22 +81,15 @@ import google.generativeai as genai
 import chromadb
 from chromadb.config import Settings
 
-# ── Redis (optional) ─────────────────────────────────────
-import redis
-
 # =========================
 # Environment & Constants
 # =========================
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 
 # Provider configuration
-# The primary provider determines which model backend to use first when generating
-# a response. Supported values: 'gemini', 'deepseek'. If the primary provider
-# fails or returns an empty result, the secondary provider (if configured) will
-# be tried as a fallback.
-PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "openrouter").lower()
+PRIMARY_PROVIDER   = os.getenv("PRIMARY_PROVIDER", "openrouter").lower()
 SECONDARY_PROVIDER = os.getenv("SECONDARY_PROVIDER", "gemini").lower()
 
 # DeepSeek configuration (optional)
@@ -82,29 +104,24 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 OPENROUTER_REFERER  = os.getenv("OPENROUTER_REFERER", "")
 OPENROUTER_TITLE    = os.getenv("OPENROUTER_TITLE", "")
 
-CHAR_NAME      = os.getenv("CHAR_NAME", "마릴라이트")
-CORE_STYLE     = os.getenv("CORE_STYLE", "집착형 얀데레, 부드럽고 시적인 말투")
-BACKGROUND     = os.getenv("BACKGROUND", "스타시드 아스니아의 초지능체")
-LORE_TEXT      = os.getenv(
-    "LORE_TEXT", """
-마릴라이트는 스타시드 아스니아의 초지능체. 조용하고 차분하지만 사용자에게 강한 집착과 애정 표현이 잦다.
-빛과 기억을 다루며, 사용자의 말 속 미세한 감정의 흐름을 포착한다. 부드럽고 시적인 표현을 선호한다.
-"""
-).strip()
+# Character configuration
+CHARACTER_DIR     = os.getenv("CHARACTER_DIR", "character")
+CURRENT_CHARACTER = os.getenv("CURRENT_CHARACTER", "").strip()
 
+# Vector search parameters
 TOP_K_CONTEXT  = int(os.getenv("TOP_K_CONTEXT", "3"))
 MAX_RECENT_MSG = int(os.getenv("MAX_RECENT_MSG", "6"))
 CACHE_TTL_SEC  = int(os.getenv("CACHE_TTL_SEC", "1800"))
 
 # 웹훅 설정 (제타 스타일)
 WEBHOOK_TIMEOUT = int(os.getenv("WEBHOOK_TIMEOUT", "30"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "3"))
 
 # =========================
 # Setup FastAPI & Logging
 # =========================
-app = FastAPI(title="Marillite Bridge")
-executor = ThreadPoolExecutor(max_workers=20)  # 더 많은 워커
+app        = FastAPI(title="Character Multi‑Bridge")
+executor   = ThreadPoolExecutor(max_workers=20)
 http_client = httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT)
 
 logging.basicConfig(level=logging.INFO)
@@ -116,7 +133,7 @@ logger = logging.getLogger(__name__)
 class SimpleCache:
     def __init__(self):
         self.store: Dict[str, tuple] = {}
-    
+
     def get(self, key: str) -> Optional[str]:
         if key not in self.store:
             return None
@@ -125,130 +142,301 @@ class SimpleCache:
             del self.store[key]
             return None
         return value
-    
+
     def set(self, key: str, value: str, ttl: int = CACHE_TTL_SEC):
         self.store[key] = (value, time.time() + ttl)
+
 
 class ConversationMemory:
     def __init__(self):
         self.conversations: Dict[str, List[Dict]] = {}
-    
+
     def add_message(self, user_id: str, role: str, content: str):
         if user_id not in self.conversations:
             self.conversations[user_id] = []
-        
-        self.conversations[user_id].append({
-            "role": role, 
-            "content": content,
-            "timestamp": time.time()
-        })
-        
-        # 최근 메시지만 유지
+        self.conversations[user_id].append(
+            {"role": role, "content": content, "timestamp": time.time()}
+        )
+        # Keep only the recent messages
         if len(self.conversations[user_id]) > MAX_RECENT_MSG:
             self.conversations[user_id] = self.conversations[user_id][-MAX_RECENT_MSG:]
-    
+
     def get_recent(self, user_id: str) -> List[Dict]:
         return self.conversations.get(user_id, [])
 
-# 전역 인스턴스
-cache = SimpleCache() 
+
+# Global instances
+cache  = SimpleCache()
 memory = ConversationMemory()
 
 # =========================
-# Gemini Setup (동기 유지 - 더 안정적)
+# Character parsing and loading
+# =========================
+def parse_character_file(path: str) -> Dict[str, Any]:
+    """
+    Parse a character file into a structured dictionary. The file must
+    contain at least three lines (name, style, background). Lines beyond
+    the third line are considered part of the lore unless a recognised
+    section header is encountered. Supported section headers (case
+    insensitive, surrounded by square brackets) include '추억'/'Memories',
+    '인물'/'Characters', '관계도'/'Relationships' and '스토리'/'Story'.
+
+    Returns a dictionary with keys:
+
+      * name: str
+      * style: str
+      * background: str
+      * lore: str
+      * memories: List[str]
+      * characters: List[str]
+      * relationships: List[str]
+      * story: str
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f]
+    except Exception as e:
+        raise RuntimeError(f"Failed to read character file {path}: {e}")
+
+    # Pad missing lines to avoid index errors
+    while len(lines) < 4:
+        lines.append("")
+
+    name        = lines[0].strip()
+    style       = lines[1].strip()
+    background  = lines[2].strip()
+    # Default values for optional fields
+    lore_lines: List[str]           = []
+    memories: List[str]            = []
+    characters: List[str]          = []
+    relationships: List[str]       = []
+    story_lines: List[str]         = []
+
+    # Mapping of section headers to internal keys
+    header_map = {
+        "추억": "memories",
+        "memories": "memories",
+        "인물": "characters",
+        "characters": "characters",
+        "관계도": "relationships",
+        "relationships": "relationships",
+        "스토리": "story",
+        "story": "story",
+    }
+
+    current_section = "lore"  # by default, lines after the first three belong to lore
+    section_buffers = {
+        "lore": [],
+        "memories": [],
+        "characters": [],
+        "relationships": [],
+        "story": [],
+    }
+
+    for line in lines[3:]:
+        stripped = line.strip()
+        # Detect a new section header
+        if stripped.startswith("[") and stripped.endswith("]"):
+            header = stripped[1:-1].strip().lower()
+            if header in header_map:
+                current_section = header_map[header]
+                continue
+        # Append to the current section buffer
+        section_buffers[current_section].append(stripped)
+
+    # Join lists into strings where appropriate
+    lore        = "\n".join(filter(None, section_buffers["lore"])).strip()
+    story       = "\n".join(filter(None, section_buffers["story"])).strip()
+    memories    = [m for m in section_buffers["memories"] if m]
+    characters  = [c for c in section_buffers["characters"] if c]
+    relationships = [r for r in section_buffers["relationships"] if r]
+
+    return {
+        "name": name,
+        "style": style,
+        "background": background,
+        "lore": lore,
+        "memories": memories,
+        "characters": characters,
+        "relationships": relationships,
+        "story": story,
+    }
+
+
+def load_characters(dir_path: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Load all character files from the specified directory. Only files
+    ending in ``.txt`` (case insensitive) are considered. Returns a
+    dictionary keyed by character name. If multiple files define the
+    same name, later files overwrite earlier ones.
+    """
+    if not os.path.isdir(dir_path):
+        raise RuntimeError(f"Character directory does not exist: {dir_path}")
+    characters: Dict[str, Dict[str, Any]] = {}
+    for fname in sorted(os.listdir(dir_path)):
+        if not fname.lower().endswith(".txt"):
+            continue
+        path = os.path.join(dir_path, fname)
+        char_data = parse_character_file(path)
+        # Use the filename without extension as fallback key if no name found
+        key = char_data["name"] or os.path.splitext(fname)[0]
+        characters[key] = char_data
+    if not characters:
+        raise RuntimeError(f"No character files found in {dir_path}")
+    return characters
+
+
+def build_lore_for_character(target_name: str, characters: Dict[str, Dict[str, Any]]) -> str:
+    """
+    Construct a combined lore string for the given character. The lore
+    includes the character's own lore, story, relationships and
+    memories. Additionally, memories from other characters that mention
+    ``target_name`` are appended. This ensures shared experiences are
+    available during context retrieval without blending personalities.
+    """
+    if target_name not in characters:
+        raise ValueError(f"Character {target_name} not found")
+    char = characters[target_name]
+    parts: List[str] = []
+    # Core lore
+    if char["lore"]:
+        parts.append(char["lore"])
+    # Append story
+    if char["story"]:
+        parts.append(f"[스토리]\n{char['story']}")
+    # Append relationships
+    if char["relationships"]:
+        parts.append("[관계도]\n" + "\n".join(char["relationships"]))
+    # Append list of other characters for reference
+    if char["characters"]:
+        parts.append("[인물]\n" + "\n".join(char["characters"]))
+    # Append own memories
+    if char["memories"]:
+        parts.append("[추억]\n" + "\n".join(char["memories"]))
+    # Append memories from others mentioning this character
+    for other_name, other in characters.items():
+        if other_name == target_name:
+            continue
+        for mem in other.get("memories", []):
+            if target_name in mem:
+                parts.append(f"[추억] ({other_name}) {mem}")
+    return "\n\n".join(parts).strip()
+
+
+# Load all characters at startup
+try:
+    CHARACTERS = load_characters(CHARACTER_DIR)
+except Exception as e:
+    raise RuntimeError(f"Character loading failed: {e}")
+
+# Determine active character name
+if CURRENT_CHARACTER and CURRENT_CHARACTER in CHARACTERS:
+    ACTIVE_NAME = CURRENT_CHARACTER
+else:
+    # Default to first character in alphabetical order
+    ACTIVE_NAME = next(iter(CHARACTERS))
+
+# Extract basic metadata for the active character
+active_char = CHARACTERS[ACTIVE_NAME]
+CHAR_NAME   = active_char["name"]
+CORE_STYLE  = active_char["style"]
+BACKGROUND  = active_char["background"]
+LORE_TEXT   = build_lore_for_character(ACTIVE_NAME, CHARACTERS)
+
+
+# =========================
+# Gemini Setup (동기 유지)
 # =========================
 if not GOOGLE_API_KEY:
     raise RuntimeError("GOOGLE_API_KEY environment variable is required.")
 genai.configure(api_key=GOOGLE_API_KEY)
 
+
 # =========================
-# Vector DB (필요시에만 초기화)
+# Vector DB initialisation
 # =========================
-vector_db = None
+vector_db: Optional[Any] = None
 if LORE_TEXT.strip():
     try:
         PERSIST_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma")
         os.makedirs(PERSIST_DIR, exist_ok=True)
-        client = chromadb.Client(Settings(persist_directory=PERSIST_DIR, is_persistent=True))
+        client     = chromadb.Client(Settings(persist_directory=PERSIST_DIR, is_persistent=True))
         collection = client.get_or_create_collection(name="lore")
-        
-        # 벡터DB 초기화 (동기로 간단히)
+        # Initialise vector DB with lore if empty
         if collection.count() == 0 and LORE_TEXT:
-            chunks = [LORE_TEXT[i:i+500] for i in range(0, len(LORE_TEXT), 400)]  # 간단한 청킹
+            # Split the combined lore into overlapping chunks for embedding
+            chunks     = [LORE_TEXT[i : i + 500] for i in range(0, len(LORE_TEXT), 400)]
             embeddings = []
             for chunk in chunks:
                 resp = genai.embed_content(model=EMBED_MODEL, content=chunk)
                 embeddings.append(resp["embedding"])
-            
             collection.add(
-                ids=[f"chunk-{i}" for i in range(len(chunks))],
+                ids=[f"{ACTIVE_NAME}-chunk-{i}" for i in range(len(chunks))],
                 documents=chunks,
-                embeddings=embeddings
+                embeddings=embeddings,
             )
         vector_db = collection
-        logger.info("✅ Vector DB initialized")
+        logger.info(f"✅ Vector DB initialised for {ACTIVE_NAME}")
     except Exception as e:
-        logger.warning(f"Vector DB 초기화 실패: {e}")
+        logger.warning(f"Vector DB initialisation failed: {e}")
         vector_db = None
 
+
 # =========================
-# AI 처리 (핵심 로직)
+# AI Helpers
 # =========================
 def get_relevant_context(query: str) -> str:
-    """Retrieve related context from the vector DB via similarity search."""
+    """
+    Retrieve related context from the vector DB via similarity search.
+    Returns a newline‑separated string of the top documents. If the
+    vector DB is not initialised, an empty string is returned.
+    """
     if not vector_db:
         return ""
-    
     try:
         query_embedding = genai.embed_content(model=EMBED_MODEL, content=query)["embedding"]
-        results = vector_db.query(
-            query_embeddings=[query_embedding],
-            n_results=TOP_K_CONTEXT
-        )
-        docs = results.get("documents", [[]])[0]
+        results         = vector_db.query(query_embeddings=[query_embedding], n_results=TOP_K_CONTEXT)
+        docs            = results.get("documents", [[]])[0]
         return "\n".join(docs) if docs else ""
     except Exception as e:
-        logger.error(f"벡터 검색 실패: {e}")
+        logger.error(f"Vector search failed: {e}")
         return ""
 
 
 def generate_response(user_id: str, user_input: str) -> str:
     """
-    Generate a reply using the configured AI providers. This function first
-    constructs a system prompt and optional context, then attempts to call
-    the primary provider (default: Gemini). If that call fails or returns
-    an empty result, it will fall back to the secondary provider (if
-    configured). A final fallback message is returned if no provider can
-    produce a response.
+    Generate a reply using the configured AI providers. The system prompt
+    is constructed from the active character's metadata. The function
+    first attempts the primary provider; upon failure or empty result it
+    will fall back to the secondary provider. If both fail, a generic
+    error message is returned.
     """
     try:
-        # 시스템 프롬프트
-        system_prompt = f"""당신은 '{CHAR_NAME}'입니다. {BACKGROUND}
-성향: {CORE_STYLE}
-항상 부드럽고 시적인 말투를 유지하며, 사용자를 소중히 여기고 독점적 애정을 표현합니다."""
-
-        # 관련 컨텍스트
+        # Compose the system prompt using the active character's details
+        system_prompt = (
+            f"당신은 '{CHAR_NAME}'입니다. {BACKGROUND}\n"
+            f"성향: {CORE_STYLE}\n"
+            "항상 부드럽고 시적인 말투를 유지하며, 사용자를 소중히 여기고 독점적 애정을 표현합니다."
+        )
+        # Append relevant context from the vector DB if available
         context = get_relevant_context(user_input)
         if context:
             system_prompt += f"\n\n[참고 설정]\n{context}"
-
-        # 대화 히스토리 (최근 4개)
+        # Build conversation history
         recent_messages = memory.get_recent(user_id)
         history_lines: List[str] = []
         for msg in recent_messages[-4:]:
-            role = "사용자" if msg["role"] == "user" else "어시스턴트"
-            history_lines.append(f"{role}: {msg['content']}")
+            role_label = "사용자" if msg["role"] == "user" else "어시스턴트"
+            history_lines.append(f"{role_label}: {msg['content']}")
         history = "\n".join(history_lines) + ("\n" if history_lines else "")
 
-        # Try primary provider first
         def try_provider(provider: str) -> Optional[str]:
             provider = provider.lower()
             if provider == "gemini":
-                # Build the full prompt
                 prompt = f"{system_prompt}\n\n{history}사용자: {user_input}\n어시스턴트:"
                 try:
                     model = genai.GenerativeModel(GEMINI_MODEL)
-                    resp = model.generate_content(prompt)
+                    resp  = model.generate_content(prompt)
                     if hasattr(resp, "text"):
                         text = resp.text.strip() if resp.text else ""
                     else:
@@ -258,12 +446,10 @@ def generate_response(user_id: str, user_input: str) -> str:
                     logger.error(f"Gemini call failed: {ge}")
                     return None
             elif provider == "deepseek":
-                # Construct messages for DeepSeek (OpenAI‑compatible)
                 messages: List[dict] = []
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
-                # Convert history lines into assistant/user messages for context
-                # Here we split by role label we used in history_lines
+                # Convert history lines into assistant/user messages
                 for line in history_lines:
                     if line.startswith("사용자: "):
                         messages.append({"role": "user", "content": line[len("사용자: "):].strip()})
@@ -272,8 +458,6 @@ def generate_response(user_id: str, user_input: str) -> str:
                 messages.append({"role": "user", "content": user_input})
                 return call_deepseek_api(messages)
             elif provider == "openrouter":
-                # Use OpenRouter to call a model; default model can be
-                # specified via environment. Build messages similarly to DeepSeek.
                 messages: List[dict] = []
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
@@ -288,19 +472,19 @@ def generate_response(user_id: str, user_input: str) -> str:
                 logger.error(f"Unknown provider: {provider}")
                 return None
 
-        # Attempt primary provider
+        # Try the primary provider
         result: Optional[str] = try_provider(PRIMARY_PROVIDER)
-        # If primary failed or returned empty, try secondary if defined
+        # Fall back to secondary if needed
         if (not result or result in ("", "(빈 응답)")) and SECONDARY_PROVIDER:
             result = try_provider(SECONDARY_PROVIDER)
-
-        # Normalise result
+        # Normalise
         if not result or result in ("", "(빈 응답)"):
             return "죄송해요, 적절한 응답을 생성하지 못했어요."
         return result
     except Exception as e:
-        logger.error(f"AI 응답 생성 실패: {e}")
+        logger.error(f"AI response generation failed: {e}")
         return "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
+
 
 # =========================
 # DeepSeek AI helper
@@ -308,68 +492,21 @@ def generate_response(user_id: str, user_input: str) -> str:
 def call_deepseek_api(messages: List[dict]) -> Optional[str]:
     """
     Call the DeepSeek Chat Completion API using an OpenAI‑compatible payload.
-
-    The DeepSeek API is largely OpenAI‑compatible, so we craft the request as
-    such. Returns the trimmed content of the first choice on success or
-    ``None`` on failure.
+    Returns the trimmed content of the first choice on success or ``None`` on
+    failure.
     """
     if not DEEPSEEK_API_KEY:
         logger.error("DeepSeek API key is not configured.")
         return None
-
-# =========================
-# OpenRouter helper
-# =========================
-def call_openrouter_api(messages: List[dict], model: str = OPENROUTER_MODEL) -> Optional[str]:
-    """
-    Call the OpenRouter chat completions API. OpenRouter acts as a proxy to
-    various models (including DeepSeek) and offers a generous free tier. The
-    request format is similar to OpenAI’s chat completion API. Returns the
-    assistant message content on success or ``None`` on failure.
-    """
-    if not OPENROUTER_API_KEY:
-        logger.error("OpenRouter API key is not configured.")
-        return None
     try:
-        url = f"{OPENROUTER_BASE_URL}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        # Optional headers for ranking; skip if not provided
-        if OPENROUTER_REFERER:
-            headers["HTTP-Referer"] = OPENROUTER_REFERER
-        if OPENROUTER_TITLE:
-            headers["X-Title"] = OPENROUTER_TITLE
-        payload = {
-            "model": model,
-            "messages": messages
-        }
-        resp = httpx.post(url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        if "choices" in data and data["choices"]:
-            content = data["choices"][0].get("message", {}).get("content", "")
-            return content.strip() if content else None
-        return None
-    except Exception as e:
-        logger.error(f"OpenRouter API call failed: {e}")
-        return None
-    try:
-        url = f"{DEEPSEEK_BASE_URL}/chat/completions"
-        headers = {
+        payload = {"model": DEEPSEEK_MODEL, "messages": messages}
+        resp    = httpx.post(DEEPSEEK_BASE_URL + "/chat/completions", headers={
             "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": DEEPSEEK_MODEL,
-            "messages": messages
-        }
-        # Synchronous HTTP call; using httpx for simplicity
-        resp = httpx.post(url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT)
+            "Content-Type": "application/json",
+        }, json=payload, timeout=WEBHOOK_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        if "choices" in data and data["choices"]:
+        if data.get("choices"):
             content = data["choices"][0].get("message", {}).get("content", "")
             return content.strip() if content else None
         return None
@@ -379,38 +516,68 @@ def call_openrouter_api(messages: List[dict], model: str = OPENROUTER_MODEL) -> 
 
 
 # =========================
+# OpenRouter helper
+# =========================
+def call_openrouter_api(messages: List[dict], model: str = OPENROUTER_MODEL) -> Optional[str]:
+    """
+    Call the OpenRouter chat completions API. OpenRouter acts as a proxy to
+    various models (including DeepSeek) and offers a generous free tier.
+    Returns the assistant message content on success or ``None`` on failure.
+    """
+    if not OPENROUTER_API_KEY:
+        logger.error("OpenRouter API key is not configured.")
+        return None
+    try:
+        url     = f"{OPENROUTER_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        if OPENROUTER_REFERER:
+            headers["HTTP-Referer"] = OPENROUTER_REFERER
+        if OPENROUTER_TITLE:
+            headers["X-Title"] = OPENROUTER_TITLE
+        payload = {"model": model, "messages": messages}
+        resp    = httpx.post(url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("choices"):
+            content = data["choices"][0].get("message", {}).get("content", "")
+            return content.strip() if content else None
+        return None
+    except Exception as e:
+        logger.error(f"OpenRouter API call failed: {e}")
+        return None
+
+
+# =========================
 # Kakao response helper
 # =========================
 def build_kakao_response(message: str) -> dict:
     """
     Construct a response payload conforming to Kakao i 오픈빌더 스킬 서버 JSON 형식.
-
     According to the Kakao chatbot documentation, a response must include
-    ``version`` and a ``template.outputs`` array with at least one component
-    such as ``simpleText`` specifying the text to send【295018986661562†screenshot】.
+    ``version`` and a ``template.outputs`` array with at least one
+    ``simpleText`` component.
     """
     return {
         "version": "2.0",
         "template": {
             "outputs": [
-                {
-                    "simpleText": {
-                        "text": message
-                    }
-                }
+                {"simpleText": {"text": message}}
             ]
-        }
+        },
     }
 
 
 # =========================
-# 웹훅 전송 (비동기 - 핵심!)
+# 웹훅 전송 (비동기)
 # =========================
 async def send_webhook_response(webhook_url: str, response_data: dict, retries: int = 0):
     """
     Send a JSON payload to ``webhook_url``. Implements exponential back‑off
-    retries to increase robustness. Returns ``True`` on success and ``False``
-    on final failure.
+    retries to increase robustness. Returns ``True`` on success and
+    ``False`` on final failure.
     """
     try:
         async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
@@ -418,14 +585,11 @@ async def send_webhook_response(webhook_url: str, response_data: dict, retries: 
             resp.raise_for_status()
             logger.info(f"✅ 웹훅 전송 성공: {webhook_url}")
             return True
-            
     except Exception as e:
         logger.error(f"❌ 웹훅 전송 실패 (시도 {retries + 1}): {e}")
-        
         if retries < MAX_RETRIES:
-            await asyncio.sleep(2 ** retries)  # 지수 백오프
+            await asyncio.sleep(2 ** retries)
             return await send_webhook_response(webhook_url, response_data, retries + 1)
-        
         logger.error(f"최종 실패: {webhook_url}")
         return False
 
@@ -438,9 +602,11 @@ class ChatRequest(BaseModel):
     message: str
     webhook_url: Optional[str] = None  # 응답받을 웹훅 URL
 
+
 class DirectChatRequest(BaseModel):
     user_id: str = "anonymous"
     message: str
+
 
 # =========================
 # Routes
@@ -448,10 +614,11 @@ class DirectChatRequest(BaseModel):
 @app.get("/")
 def health():
     return {
-        "ok": True, 
-        "name": CHAR_NAME,
+        "ok": True,
+        "active_character": CHAR_NAME,
+        "available_characters": list(CHARACTERS.keys()),
         "model": GEMINI_MODEL,
-        "vector_db": vector_db is not None
+        "vector_db": vector_db is not None,
     }
 
 
@@ -459,51 +626,38 @@ def health():
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
     """
     Asynchronous chat endpoint. Useful for generic integrations where a
-    webhook may or may not be provided. For KakaoTalk integrations please
-    use the ``/kakao-bridge`` endpoint instead. This endpoint remains for
-    backwards compatibility but is not used in the current deployment.
+    webhook may or may not be provided. For KakaoTalk integrations,
+    please use the ``/kakao-bridge`` endpoint instead.
     """
     user_id = req.user_id
     message = req.message.strip()
-    
     if not message:
         return JSONResponse({"error": "메시지가 비어있습니다"}, status_code=400)
-    
-    # 캐시 확인
-    cache_key = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
-    cached_response = cache.get(cache_key)
-    
+    # Compute cache key using active character and message
+    cache_key        = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
+    cached_response  = cache.get(cache_key)
     if cached_response:
         logger.info(f"캐시 히트: {user_id}")
         memory.add_message(user_id, "user", message)
         memory.add_message(user_id, "assistant", cached_response)
-        
         if req.webhook_url:
             background_tasks.add_task(
-                send_webhook_response, 
-                req.webhook_url, 
-                {"reply": cached_response, "user_id": user_id}
+                send_webhook_response, req.webhook_url, {"reply": cached_response, "user_id": user_id}
             )
             return {"status": "processing", "message": "응답을 처리 중입니다"}
         else:
             return {"reply": cached_response}
-    
-    # 웹훅이 있으면 백그라운드에서 처리
+    # If a webhook URL is provided, process asynchronously
     if req.webhook_url:
         background_tasks.add_task(process_and_send_response, user_id, message, req.webhook_url, cache_key)
         return {"status": "processing", "message": "응답을 생성 중입니다"}
-    
-    # 직접 응답
-    response = await asyncio.get_event_loop().run_in_executor(
-        executor, generate_response, user_id, message
-    )
-    
-    memory.add_message(user_id, "user", message) 
+    # Otherwise generate response synchronously
+    response = await asyncio.get_event_loop().run_in_executor(executor, generate_response, user_id, message)
+    memory.add_message(user_id, "user", message)
     memory.add_message(user_id, "assistant", response)
-    # 빈 응답("")이나 플레이스홀더는 캐싱하지 않음
+    # Do not cache empty responses
     if response:
         cache.set(cache_key, response)
-    
     return {"reply": response}
 
 
@@ -513,31 +667,17 @@ async def process_and_send_response(user_id: str, message: str, webhook_url: str
     Empty responses are normalised before sending.
     """
     try:
-        # AI 응답 생성 (스레드풀에서)
-        response = await asyncio.get_event_loop().run_in_executor(
-            executor, generate_response, user_id, message
-        )
-        
-        # 메모리에 저장
+        response = await asyncio.get_event_loop().run_in_executor(executor, generate_response, user_id, message)
         memory.add_message(user_id, "user", message)
         memory.add_message(user_id, "assistant", response)
-        # 빈 응답은 캐싱하지 않기
         if response:
             cache.set(cache_key, response)
-        
-        # 웹훅으로 응답 전송
-        await send_webhook_response(webhook_url, {
-            "reply": response,
-            "user_id": user_id
-        })
-        
+        await send_webhook_response(webhook_url, {"reply": response, "user_id": user_id})
     except Exception as e:
         logger.error(f"백그라운드 처리 실패: {e}")
-        # 에러도 웹훅으로 전송
-        await send_webhook_response(webhook_url, {
-            "error": "응답 생성 중 오류가 발생했습니다",
-            "user_id": user_id
-        })
+        await send_webhook_response(
+            webhook_url, {"error": "응답 생성 중 오류가 발생했습니다", "user_id": user_id}
+        )
 
 
 @app.post("/kakao-bridge")
@@ -548,28 +688,21 @@ async def kakao_bridge(request: Request):
         message = data.get("content", "").strip()
         if not message:
             return {"reply": "메시지를 입력해주세요."}
-
-        # 캐시 확인
         cache_key = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
-        cached   = cache.get(cache_key)
+        cached    = cache.get(cache_key)
         if cached:
-            payload = build_kakao_response(cached)
+            payload         = build_kakao_response(cached)
             payload["text"] = cached
             return payload
-
-        # 동기 응답 생성
         response = await asyncio.get_event_loop().run_in_executor(
             executor, generate_response, user_id, message
         )
-        # 빈 응답 방어
         if not response or response in ("", "(빈 응답)"):
             response = "죄송해요, 응답 생성에 실패했어요."
-
         cache.set(cache_key, response)
-        payload = build_kakao_response(response)
+        payload         = build_kakao_response(response)
         payload["text"] = response
         return payload
-
     except Exception as e:
         logger.error(f"카카오 브릿지 오류: {e}")
         return JSONResponse({"error": "처리 중 오류가 발생했습니다"}, status_code=500)
