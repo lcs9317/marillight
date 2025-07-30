@@ -276,9 +276,9 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
     
     memory.add_message(user_id, "user", message) 
     memory.add_message(user_id, "assistant", response)
-+    # 빈 응답("")이나 플레이스홀더 "(빈 응답)" 은 캐싱하지 않음
-+    if response and response != "(빈 응답)":
-+        cache.set(cache_key, response)
+    # 빈 응답("")이나 플레이스홀더 "(빈 응답)" 은 캐싱하지 않음
+    if response and response != "(빈 응답)":
+        cache.set(cache_key, response)
     
     return {"reply": response}
 
@@ -293,9 +293,9 @@ async def process_and_send_response(user_id: str, message: str, webhook_url: str
         # 메모리에 저장
         memory.add_message(user_id, "user", message)
         memory.add_message(user_id, "assistant", response)
-+        # 빈 응답은 캐싱하지 않기
-+        if response and response != "(빈 응답)":
-+            cache.set(cache_key, response)
+        # 빈 응답은 캐싱하지 않기
+        if response and response != "(빈 응답)":
+            cache.set(cache_key, response)
         
         # 웹훅으로 응답 전송
         await send_webhook_response(webhook_url, {
