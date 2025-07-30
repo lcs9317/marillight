@@ -171,7 +171,17 @@ class AppState:
         """Initialize Gemini client."""
         if not config.GOOGLE_API_KEY:
             raise RuntimeError("GOOGLE_API_KEY is required")
-        self.gemini_client = genai.Client(api_key=config.GOOGLE_API_KEY)
+        
+        try:
+            # genai.Client() 대신 genai.configure() 사용
+            genai.configure(api_key=config.GOOGLE_API_KEY)
+            # 테스트 호출로 API 키 검증
+            await asyncio.to_thread(genai.list_models)
+            self.gemini_client = genai  # genai 모듈 자체를 저장
+            print("✅ Gemini client initialized successfully")
+        except Exception as e:
+            print(f"❌ Gemini initialization failed: {e}")
+            raise RuntimeError(f"Failed to initialize Gemini: {e}")
     
     async def _init_chroma(self):
         """Initialize ChromaDB."""
@@ -213,14 +223,15 @@ class AppState:
             
             try:
                 resp = await asyncio.to_thread(
-                    self.gemini_client.embed_content,
+                    genai.embed_content,  # 직접 genai 모듈 사용
                     model=config.EMBED_MODEL,
                     content=text
                 )
                 embedding = resp["embedding"]
                 self._embed_cache[cache_key] = embedding
                 embeddings.append(embedding)
-            except Exception:
+            except Exception as e:
+                print(f"❌ Embedding failed for text: {text[:50]}... Error: {e}")
                 # Fallback: zero vector
                 embeddings.append([0.0] * 768)
         
@@ -337,13 +348,14 @@ async def build_prompt(user_id: str, text: str) -> str:
 async def call_gemini(prompt: str) -> str:
     """Call Gemini API with error handling."""
     try:
+        model = genai.GenerativeModel(config.GEMINI_MODEL)
         response = await asyncio.to_thread(
-            state.gemini_client.models.generate_content,
-            model=config.GEMINI_MODEL,
-            contents=prompt
+            model.generate_content,
+            prompt
         )
         return getattr(response, "text", "") or "(응답을 생성할 수 없어요.)"
     except Exception as e:
+        print(f"❌ Gemini API call failed: {e}")
         return f"죄송해요, 일시적인 오류가 발생했어요. ({str(e)[:50]}...)"
 
 # =========================
@@ -371,7 +383,11 @@ async def health_check():
         "character": config.CHAR_NAME,
         "model": config.GEMINI_MODEL,
         "users_in_memory": len(state.memory.mem),
-        "cache_size": len(state.cache.store)
+        "cache_size": len(state.cache.store),
+        "api_key_set": bool(config.GOOGLE_API_KEY),
+        "api_key_length": len(config.GOOGLE_API_KEY) if config.GOOGLE_API_KEY else 0,
+        "gemini_ready": state.gemini_client is not None,
+        "chroma_ready": state.collection is not None
     }
 
 @app.post("/kakao-bridge", response_model=ChatResponse)
