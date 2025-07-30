@@ -62,6 +62,26 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 
+# Provider configuration
+# The primary provider determines which model backend to use first when generating
+# a response. Supported values: 'gemini', 'deepseek'. If the primary provider
+# fails or returns an empty result, the secondary provider (if configured) will
+# be tried as a fallback.
+PRIMARY_PROVIDER = os.getenv("PRIMARY_PROVIDER", "gemini").lower()
+SECONDARY_PROVIDER = os.getenv("SECONDARY_PROVIDER", "").lower()
+
+# DeepSeek configuration (optional)
+DEEPSEEK_API_KEY  = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL    = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+
+# OpenRouter configuration (optional)
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1:free")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_REFERER  = os.getenv("OPENROUTER_REFERER", "")
+OPENROUTER_TITLE    = os.getenv("OPENROUTER_TITLE", "")
+
 CHAR_NAME      = os.getenv("CHAR_NAME", "마릴라이트")
 CORE_STYLE     = os.getenv("CORE_STYLE", "집착형 얀데레, 부드럽고 시적인 말투")
 BACKGROUND     = os.getenv("BACKGROUND", "스타시드 아스니아의 초지능체")
@@ -194,15 +214,12 @@ def get_relevant_context(query: str) -> str:
 
 def generate_response(user_id: str, user_input: str) -> str:
     """
-    Generate a reply using the Gemini model. This function is intentionally
-    synchronous—it blocks until a response is returned. When used from an
-    async endpoint, run it in a thread pool to avoid blocking the event
-    loop.
-
-    To guard against the model returning empty strings or the literal
-    "(빈 응답)", this function normalises such outputs to a user‑friendly
-    fallback message. Without this guard, clients would need to filter out
-    these placeholders themselves.
+    Generate a reply using the configured AI providers. This function first
+    constructs a system prompt and optional context, then attempts to call
+    the primary provider (default: Gemini). If that call fails or returns
+    an empty result, it will fall back to the secondary provider (if
+    configured). A final fallback message is returned if no provider can
+    produce a response.
     """
     try:
         # 시스템 프롬프트
@@ -210,43 +227,155 @@ def generate_response(user_id: str, user_input: str) -> str:
 성향: {CORE_STYLE}
 항상 부드럽고 시적인 말투를 유지하며, 사용자를 소중히 여기고 독점적 애정을 표현합니다."""
 
-        # 관련 컨텍스트 
+        # 관련 컨텍스트
         context = get_relevant_context(user_input)
         if context:
             system_prompt += f"\n\n[참고 설정]\n{context}"
 
-        # 대화 히스토리
+        # 대화 히스토리 (최근 4개)
         recent_messages = memory.get_recent(user_id)
-        history = ""
-        for msg in recent_messages[-4:]:  # 최근 4개만
+        history_lines: List[str] = []
+        for msg in recent_messages[-4:]:
             role = "사용자" if msg["role"] == "user" else "어시스턴트"
-            history += f"{role}: {msg['content']}\n"
+            history_lines.append(f"{role}: {msg['content']}")
+        history = "\n".join(history_lines) + ("\n" if history_lines else "")
 
-        # 최종 프롬프트
-        prompt = f"{system_prompt}\n\n{history}사용자: {user_input}\n어시스턴트:"
+        # Try primary provider first
+        def try_provider(provider: str) -> Optional[str]:
+            provider = provider.lower()
+            if provider == "gemini":
+                # Build the full prompt
+                prompt = f"{system_prompt}\n\n{history}사용자: {user_input}\n어시스턴트:"
+                try:
+                    model = genai.GenerativeModel(GEMINI_MODEL)
+                    resp = model.generate_content(prompt)
+                    if hasattr(resp, "text"):
+                        text = resp.text.strip() if resp.text else ""
+                    else:
+                        text = str(resp).strip() if resp else ""
+                    return text if text else None
+                except Exception as ge:
+                    logger.error(f"Gemini call failed: {ge}")
+                    return None
+            elif provider == "deepseek":
+                # Construct messages for DeepSeek (OpenAI‑compatible)
+                messages: List[dict] = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                # Convert history lines into assistant/user messages for context
+                # Here we split by role label we used in history_lines
+                for line in history_lines:
+                    if line.startswith("사용자: "):
+                        messages.append({"role": "user", "content": line[len("사용자: "):].strip()})
+                    elif line.startswith("어시스턴트: "):
+                        messages.append({"role": "assistant", "content": line[len("어시스턴트: "):].strip()})
+                messages.append({"role": "user", "content": user_input})
+                return call_deepseek_api(messages)
+            elif provider == "openrouter":
+                # Use OpenRouter to call a model; default model can be
+                # specified via environment. Build messages similarly to DeepSeek.
+                messages: List[dict] = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                for line in history_lines:
+                    if line.startswith("사용자: "):
+                        messages.append({"role": "user", "content": line[len("사용자: "):].strip()})
+                    elif line.startswith("어시스턴트: "):
+                        messages.append({"role": "assistant", "content": line[len("어시스턴트: "):].strip()})
+                messages.append({"role": "user", "content": user_input})
+                return call_openrouter_api(messages)
+            else:
+                logger.error(f"Unknown provider: {provider}")
+                return None
 
-        # Gemini 호출
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        response = model.generate_content(prompt)
-        
-        # 일부 모델 구현은 빈 문자열이나 "(빈 응답)"을 반환할 수 있다. 이를 검사하여
-        # 적절한 대체 문구로 치환한다.
-        result: str
-        if hasattr(response, "text"):
-            result = response.text.strip() if response.text else ""
-        else:
-            # 예기치 않은 응답 타입 – 문자열로 취급
-            result = str(response).strip() if response else ""
+        # Attempt primary provider
+        result: Optional[str] = try_provider(PRIMARY_PROVIDER)
+        # If primary failed or returned empty, try secondary if defined
+        if (not result or result in ("", "(빈 응답)")) and SECONDARY_PROVIDER:
+            result = try_provider(SECONDARY_PROVIDER)
 
-        # 빈 문자열이나 특별한 플레이스홀더를 감지
+        # Normalise result
         if not result or result in ("", "(빈 응답)"):
-            result = "죄송해요, 적절한 응답을 생성하지 못했어요."
-
+            return "죄송해요, 적절한 응답을 생성하지 못했어요."
         return result
-        
     except Exception as e:
         logger.error(f"AI 응답 생성 실패: {e}")
         return "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
+
+# =========================
+# DeepSeek AI helper
+# =========================
+def call_deepseek_api(messages: List[dict]) -> Optional[str]:
+    """
+    Call the DeepSeek Chat Completion API using an OpenAI‑compatible payload.
+
+    The DeepSeek API is largely OpenAI‑compatible, so we craft the request as
+    such. Returns the trimmed content of the first choice on success or
+    ``None`` on failure.
+    """
+    if not DEEPSEEK_API_KEY:
+        logger.error("DeepSeek API key is not configured.")
+        return None
+
+# =========================
+# OpenRouter helper
+# =========================
+def call_openrouter_api(messages: List[dict], model: str = OPENROUTER_MODEL) -> Optional[str]:
+    """
+    Call the OpenRouter chat completions API. OpenRouter acts as a proxy to
+    various models (including DeepSeek) and offers a generous free tier. The
+    request format is similar to OpenAI’s chat completion API. Returns the
+    assistant message content on success or ``None`` on failure.
+    """
+    if not OPENROUTER_API_KEY:
+        logger.error("OpenRouter API key is not configured.")
+        return None
+    try:
+        url = f"{OPENROUTER_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        # Optional headers for ranking; skip if not provided
+        if OPENROUTER_REFERER:
+            headers["HTTP-Referer"] = OPENROUTER_REFERER
+        if OPENROUTER_TITLE:
+            headers["X-Title"] = OPENROUTER_TITLE
+        payload = {
+            "model": model,
+            "messages": messages
+        }
+        resp = httpx.post(url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and data["choices"]:
+            content = data["choices"][0].get("message", {}).get("content", "")
+            return content.strip() if content else None
+        return None
+    except Exception as e:
+        logger.error(f"OpenRouter API call failed: {e}")
+        return None
+    try:
+        url = f"{DEEPSEEK_BASE_URL}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": DEEPSEEK_MODEL,
+            "messages": messages
+        }
+        # Synchronous HTTP call; using httpx for simplicity
+        resp = httpx.post(url, headers=headers, json=payload, timeout=WEBHOOK_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if "choices" in data and data["choices"]:
+            content = data["choices"][0].get("message", {}).get("content", "")
+            return content.strip() if content else None
+        return None
+    except Exception as e:
+        logger.error(f"DeepSeek API call failed: {e}")
+        return None
 
 
 # =========================
