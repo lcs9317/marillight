@@ -540,103 +540,36 @@ async def process_and_send_response(user_id: str, message: str, webhook_url: str
         })
 
 
-@app.post("/direct-chat")
-async def direct_chat(req: DirectChatRequest):
-    """
-    Immediate response endpoint. Useful for quick tests. In production you
-    likely want to use ``/chat`` or ``/kakao-bridge`` instead.
-    """
-    response = await asyncio.get_event_loop().run_in_executor(
-        executor, generate_response, req.user_id, req.message
-    )
-    return {"reply": response}
-
-
-# 카카오톡 호환 (기존 유지)
-@app.post("/kakao-bridge") 
-async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
-    """
-    KakaoTalk bridge endpoint supporting both immediate replies and Zeta‑style
-    asynchronous processing via webhooks.
-
-    **Payload format:**
-
-    ```json
-    {
-      "user_key": "<unique user id>",
-      "content": "<user message>",
-      "webhook_url": "<optional URL to receive the reply>"
-    }
-    ```
-
-    If ``webhook_url`` is provided, the server will acknowledge the request
-    immediately and send the computed reply to the given URL once it’s ready.
-    Without a ``webhook_url`` the response is returned inline.
-    """
+@app.post("/kakao-bridge")
+async def kakao_bridge(request: Request):
     try:
-        body = await request.body()
-        data = orjson.loads(body) if body else {}
-        
-        # 기존 키(room, text)와 새로운 키(user_key, content) 모두 허용
-        user_id  = data.get("user_key") or data.get("room") or "kakao_user"
-        message  = data.get("content") or data.get("text") or ""
-        webhook_url = data.get("webhook_url")
-        
+        data    = orjson.loads(await request.body())
+        user_id = data.get("user_key", "kakao_user")
+        message = data.get("content", "").strip()
         if not message:
             return {"reply": "메시지를 입력해주세요."}
-        cache_key = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
-        # 캐시 확인
-        cached = cache.get(cache_key)
-        if cached:
-            # If a webhook is provided, send the cached response asynchronously
-            if webhook_url:
-                background_tasks.add_task(
-                    send_webhook_response,
-                    webhook_url,
-                    {"reply": cached, "user_id": user_id}
-                )
-                # Return the cached answer to Kakao in the required JSON format.
-                payload = build_kakao_response(cached)
-                # Also include a top-level 'text' field for custom clients that
-                # expect just a plain text response.
-                payload["text"] = cached
-                return payload
-            else:
-                payload = build_kakao_response(cached)
-                payload["text"] = cached
-                return payload
 
-        # If a webhook is provided, generate response asynchronously and defer delivery
-        if webhook_url:
-            background_tasks.add_task(
-                process_and_send_response,
-                user_id,
-                message,
-                webhook_url,
-                cache_key
-            )
-            # 카카오채널은 단 한 번의 메시지만 전송할 수 있으므로 즉시 안내 메시지를 반환
-            message_for_user = "답변을 생성 중입니다. 잠시만 기다려 주세요."
-            payload = build_kakao_response(message_for_user)
-            payload["text"] = message_for_user
+        # 캐시 확인
+        cache_key = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
+        cached   = cache.get(cache_key)
+        if cached:
+            payload = build_kakao_response(cached)
+            payload["text"] = cached
             return payload
 
-        # Otherwise generate a reply immediately
+        # 동기 응답 생성
         response = await asyncio.get_event_loop().run_in_executor(
             executor, generate_response, user_id, message
         )
-
-        # Defensive programming: normalise empty or placeholder responses
+        # 빈 응답 방어
         if not response or response in ("", "(빈 응답)"):
-            response = "죄송해요, 적절한 응답을 생성하지 못했어요."
+            response = "죄송해요, 응답 생성에 실패했어요."
 
-        if response:
-            cache.set(cache_key, response)
-        
+        cache.set(cache_key, response)
         payload = build_kakao_response(response)
         payload["text"] = response
         return payload
-        
+
     except Exception as e:
         logger.error(f"카카오 브릿지 오류: {e}")
         return JSONResponse({"error": "처리 중 오류가 발생했습니다"}, status_code=500)
