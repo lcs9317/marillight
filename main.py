@@ -965,6 +965,12 @@ async def kakao_bridge(request: Request):
         message = data.get("content", "").strip()
         if not message:
             return {"reply": "메시지를 입력해주세요."}
+
+        if "기억해" in message:
+            longterm.add_memory(user_id, message)
+            memory.add_message(user_id, "user", message)
+            memory.add_message(user_id, "assistant", "알겠어요, 기억해둘게요!")
+            return build_kakao_response("알겠어요, 기억해둘게요!")
         # Record the user message in short‑term and long‑term memory
         memory.add_message(user_id, "user", message)
         longterm.add_memory(user_id, message)
