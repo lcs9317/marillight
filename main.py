@@ -12,6 +12,39 @@ from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+"""
+This file exposes a simple chatbot service built on top of Google’s Gemini API.
+
+It uses FastAPI to expose a handful of endpoints that can be used by different
+front‑end clients. The primary consumer in this scenario is KakaoTalk via the
+``/kakao‑bridge`` route. Incoming messages are processed through an in‑memory
+conversation store, relevant context is retrieved from a vector database (if
+configured), and a response is generated via the Gemini model.
+
+Key improvements compared to the initial version:
+
+* Robust handling of blank or placeholder responses. Previously, the
+  underlying model could return an empty string or the literal marker
+  ``"(빈 응답)"``. To avoid confusing the end user with an empty reply,
+  ``generate_response`` now normalises such cases to a friendly fallback
+  message. Downstream callers no longer need to worry about filtering
+  `(빈 응답)` explicitly.
+
+* Additional guard logic in the Kakao bridge route ensures that even if a
+  blank string slips through from the model, the user still receives a
+  meaningful message. This helps maintain a consistent conversation flow on
+  platforms like KakaoTalk where immediate feedback is important.
+
+* The synchronous ``generate_response`` remains unchanged in its design—by
+  default it runs in a thread pool when called from an async endpoint. If
+  you choose to call it directly (i.e., without ``run_in_executor``), ensure
+  that your FastAPI route is declared with ``async def`` and that blocking
+  operations will not starve the event loop.
+
+To run this service you need to set the ``GOOGLE_API_KEY`` environment
+variable. Consult the README for further configuration instructions.
+"""
+
 # ── Google Gemini ─────────────────────────────────────────
 import google.generativeai as genai
 
@@ -26,16 +59,18 @@ import redis
 # Environment & Constants
 # =========================
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  
+GEMINI_MODEL   = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")  
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "text-embedding-004")
 
 CHAR_NAME      = os.getenv("CHAR_NAME", "마릴라이트")
 CORE_STYLE     = os.getenv("CORE_STYLE", "집착형 얀데레, 부드럽고 시적인 말투")
 BACKGROUND     = os.getenv("BACKGROUND", "스타시드 아스니아의 초지능체")
-LORE_TEXT      = os.getenv("LORE_TEXT", """
+LORE_TEXT      = os.getenv(
+    "LORE_TEXT", """
 마릴라이트는 스타시드 아스니아의 초지능체. 조용하고 차분하지만 사용자에게 강한 집착과 애정 표현이 잦다.
 빛과 기억을 다루며, 사용자의 말 속 미세한 감정의 흐름을 포착한다. 부드럽고 시적인 표현을 선호한다.
-""").strip()
+"""
+).strip()
 
 TOP_K_CONTEXT  = int(os.getenv("TOP_K_CONTEXT", "3"))
 MAX_RECENT_MSG = int(os.getenv("MAX_RECENT_MSG", "6"))
@@ -140,7 +175,7 @@ if LORE_TEXT.strip():
 # AI 처리 (핵심 로직)
 # =========================
 def get_relevant_context(query: str) -> str:
-    """벡터 검색으로 관련 컨텍스트 가져오기"""
+    """Retrieve related context from the vector DB via similarity search."""
     if not vector_db:
         return ""
     
@@ -156,8 +191,19 @@ def get_relevant_context(query: str) -> str:
         logger.error(f"벡터 검색 실패: {e}")
         return ""
 
+
 def generate_response(user_id: str, user_input: str) -> str:
-    """AI 응답 생성 (동기 - 안정성 우선)"""
+    """
+    Generate a reply using the Gemini model. This function is intentionally
+    synchronous—it blocks until a response is returned. When used from an
+    async endpoint, run it in a thread pool to avoid blocking the event
+    loop.
+
+    To guard against the model returning empty strings or the literal
+    "(빈 응답)", this function normalises such outputs to a user‑friendly
+    fallback message. Without this guard, clients would need to filter out
+    these placeholders themselves.
+    """
     try:
         # 시스템 프롬프트
         system_prompt = f"""당신은 '{CHAR_NAME}'입니다. {BACKGROUND}
@@ -183,18 +229,35 @@ def generate_response(user_id: str, user_input: str) -> str:
         model = genai.GenerativeModel(GEMINI_MODEL)
         response = model.generate_content(prompt)
         
-        result = response.text.strip() if hasattr(response, "text") and response.text else "죄송해요, 응답을 생성할 수 없어요."
+        # 일부 모델 구현은 빈 문자열이나 "(빈 응답)"을 반환할 수 있다. 이를 검사하여
+        # 적절한 대체 문구로 치환한다.
+        result: str
+        if hasattr(response, "text"):
+            result = response.text.strip() if response.text else ""
+        else:
+            # 예기치 않은 응답 타입 – 문자열로 취급
+            result = str(response).strip() if response else ""
+
+        # 빈 문자열이나 특별한 플레이스홀더를 감지
+        if not result or result in ("", "(빈 응답)"):
+            result = "죄송해요, 적절한 응답을 생성하지 못했어요."
+
         return result
         
     except Exception as e:
         logger.error(f"AI 응답 생성 실패: {e}")
         return "일시적인 오류가 발생했어요. 잠시 후 다시 시도해 주세요."
 
+
 # =========================
 # 웹훅 전송 (비동기 - 핵심!)
 # =========================
 async def send_webhook_response(webhook_url: str, response_data: dict, retries: int = 0):
-    """웹훅 응답 전송 (재시도 포함)"""
+    """
+    Send a JSON payload to ``webhook_url``. Implements exponential back‑off
+    retries to increase robustness. Returns ``True`` on success and ``False``
+    on final failure.
+    """
     try:
         async with httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT) as client:
             resp = await client.post(webhook_url, json=response_data)
@@ -211,6 +274,7 @@ async def send_webhook_response(webhook_url: str, response_data: dict, retries: 
         
         logger.error(f"최종 실패: {webhook_url}")
         return False
+
 
 # =========================
 # API Models
@@ -236,9 +300,15 @@ def health():
         "vector_db": vector_db is not None
     }
 
+
 @app.post("/chat")
 async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
-    """비동기 채팅 엔드포인트 (제타 스타일)"""
+    """
+    Asynchronous chat endpoint. Useful for generic integrations where a
+    webhook may or may not be provided. For KakaoTalk integrations please
+    use the ``/kakao-bridge`` endpoint instead. This endpoint remains for
+    backwards compatibility but is not used in the current deployment.
+    """
     user_id = req.user_id
     message = req.message.strip()
     
@@ -276,14 +346,18 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
     
     memory.add_message(user_id, "user", message) 
     memory.add_message(user_id, "assistant", response)
-    # 빈 응답("")이나 플레이스홀더 "(빈 응답)" 은 캐싱하지 않음
-    if response and response != "(빈 응답)":
+    # 빈 응답("")이나 플레이스홀더는 캐싱하지 않음
+    if response:
         cache.set(cache_key, response)
     
     return {"reply": response}
 
+
 async def process_and_send_response(user_id: str, message: str, webhook_url: str, cache_key: str):
-    """백그라운드에서 AI 응답 생성 후 웹훅 전송"""
+    """
+    Background task that generates a response and delivers it to a webhook.
+    Empty responses are normalised before sending.
+    """
     try:
         # AI 응답 생성 (스레드풀에서)
         response = await asyncio.get_event_loop().run_in_executor(
@@ -294,7 +368,7 @@ async def process_and_send_response(user_id: str, message: str, webhook_url: str
         memory.add_message(user_id, "user", message)
         memory.add_message(user_id, "assistant", response)
         # 빈 응답은 캐싱하지 않기
-        if response and response != "(빈 응답)":
+        if response:
             cache.set(cache_key, response)
         
         # 웹훅으로 응답 전송
@@ -311,23 +385,47 @@ async def process_and_send_response(user_id: str, message: str, webhook_url: str
             "user_id": user_id
         })
 
+
 @app.post("/direct-chat")
 async def direct_chat(req: DirectChatRequest):
-    """즉시 응답 (테스트용)"""
+    """
+    Immediate response endpoint. Useful for quick tests. In production you
+    likely want to use ``/chat`` or ``/kakao-bridge`` instead.
+    """
     response = await asyncio.get_event_loop().run_in_executor(
         executor, generate_response, req.user_id, req.message
     )
     return {"reply": response}
 
+
 # 카카오톡 호환 (기존 유지)
 @app.post("/kakao-bridge") 
-async def kakao_bridge(request: Request):
+async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
+    """
+    KakaoTalk bridge endpoint supporting both immediate replies and Zeta‑style
+    asynchronous processing via webhooks.
+
+    **Payload format:**
+
+    ```json
+    {
+      "user_key": "<unique user id>",
+      "content": "<user message>",
+      "webhook_url": "<optional URL to receive the reply>"
+    }
+    ```
+
+    If ``webhook_url`` is provided, the server will acknowledge the request
+    immediately and send the computed reply to the given URL once it’s ready.
+    Without a ``webhook_url`` the response is returned inline.
+    """
     try:
         body = await request.body()
         data = orjson.loads(body) if body else {}
         
         user_id = data.get("user_key", "kakao_user")
         message = data.get("content", "").strip()
+        webhook_url = data.get("webhook_url")
         
         if not message:
             return {"reply": "메시지를 입력해주세요."}
@@ -335,13 +433,38 @@ async def kakao_bridge(request: Request):
         # 캐시 확인
         cached = cache.get(cache_key)
         if cached:
-            return {"reply": cached}
+            # If a webhook is provided, send the cached response asynchronously
+            if webhook_url:
+                background_tasks.add_task(
+                    send_webhook_response,
+                    webhook_url,
+                    {"reply": cached, "user_id": user_id}
+                )
+                return {"status": "processing", "message": "응답을 처리 중입니다"}
+            else:
+                return {"reply": cached}
 
+        # If a webhook is provided, generate response asynchronously and defer delivery
+        if webhook_url:
+            background_tasks.add_task(
+                process_and_send_response,
+                user_id,
+                message,
+                webhook_url,
+                cache_key
+            )
+            return {"status": "processing", "message": "응답을 생성 중입니다"}
+
+        # Otherwise generate a reply immediately
         response = await asyncio.get_event_loop().run_in_executor(
             executor, generate_response, user_id, message
         )
 
-        if response and response != "(빈 응답)":
+        # Defensive programming: normalise empty or placeholder responses
+        if not response or response in ("", "(빈 응답)"):
+            response = "죄송해요, 적절한 응답을 생성하지 못했어요."
+
+        if response:
             cache.set(cache_key, response)
         
         return {"reply": response}
