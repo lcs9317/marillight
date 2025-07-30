@@ -511,33 +511,108 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 
 # =========================
-# Vector DB initialisation
+# Vector DB initialisation parameters
 # =========================
+# We defer vector DB creation to the startup event to avoid blocking server
 vector_db: Optional[Any] = None
-if LORE_TEXT.strip():
+vector_db_ready: bool = False
+
+# Chunk parameters: longer chunks with moderate overlap reduce embed calls
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_STEP = int(os.getenv("CHUNK_STEP", "700"))
+
+# Directory for persisting Chroma and embedding caches
+PERSIST_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma")
+
+# Embedding cache file for lore chunks
+EMBEDDING_CACHE_FILE = os.path.join(PERSIST_DIR, "embeddings.json")
+
+# Helper: cache query embedding using functools.lru_cache
+from functools import lru_cache
+
+@lru_cache(maxsize=256)
+def get_query_embedding(text: str) -> List[float]:
+    """
+    Compute or retrieve from cache the embedding of a query string. This
+    function caches up to 256 unique queries in memory, avoiding
+    repeated calls to the embedding API for identical inputs.
+    """
     try:
-        PERSIST_DIR = os.getenv("CHROMA_DIR", "/tmp/chroma")
-        os.makedirs(PERSIST_DIR, exist_ok=True)
-        client     = chromadb.Client(Settings(persist_directory=PERSIST_DIR, is_persistent=True))
-        collection = client.get_or_create_collection(name="lore")
-        # Initialise vector DB with lore if empty
-        if collection.count() == 0 and LORE_TEXT:
-            # Split the combined lore into overlapping chunks for embedding
-            chunks     = [LORE_TEXT[i : i + 500] for i in range(0, len(LORE_TEXT), 400)]
-            embeddings = []
-            for chunk in chunks:
-                resp = genai.embed_content(model=EMBED_MODEL, content=chunk)
-                embeddings.append(resp["embedding"])
-            collection.add(
-                ids=[f"{ACTIVE_NAME}-chunk-{i}" for i in range(len(chunks))],
-                documents=chunks,
-                embeddings=embeddings,
-            )
-        vector_db = collection
-        logger.info(f"✅ Vector DB initialised for {ACTIVE_NAME}")
+        resp = genai.embed_content(model=EMBED_MODEL, content=text)
+        return resp["embedding"]
     except Exception as e:
-        logger.warning(f"Vector DB initialisation failed: {e}")
-        vector_db = None
+        logger.error(f"Query embedding failed: {e}")
+        return []
+
+
+async def load_or_compute_embeddings(chunks: List[str]) -> List[List[float]]:
+    """
+    Load embeddings from a cache file if available, otherwise compute
+    them asynchronously. The cache is stored in JSON format at
+    ``EMBEDDING_CACHE_FILE`` within ``PERSIST_DIR``. When computing,
+    embeddings are generated concurrently via asyncio tasks and then
+    saved for future use.
+    """
+    if os.path.exists(EMBEDDING_CACHE_FILE):
+        try:
+            import json
+            with open(EMBEDDING_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "embeddings" in data:
+                return data["embeddings"]
+        except Exception as e:
+            logger.warning(f"Failed to load embeddings cache: {e}")
+    # Compute embeddings concurrently
+    tasks = []
+    for chunk in chunks:
+        tasks.append(asyncio.create_task(genai.embed_content(model=EMBED_MODEL, content=chunk)))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    embeddings: List[List[float]] = []
+    for res in results:
+        if isinstance(res, Exception):
+            logger.error(f"Embedding request error: {res}")
+        else:
+            embeddings.append(res.get("embedding", []))
+    # Save to cache
+    try:
+        import json
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(EMBEDDING_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"embeddings": embeddings}, f)
+    except Exception as e:
+        logger.warning(f"Failed to save embeddings cache: {e}")
+    return embeddings
+
+
+# Startup hook to initialise the vector DB asynchronously
+@app.on_event("startup")
+async def initialise_vector_db() -> None:
+    """
+    FastAPI startup hook. Schedule asynchronous embedding computation and
+    vector DB population in the background. While this runs, the server
+    can start responding to requests; get_relevant_context will return
+    empty context until the vector DB is ready.
+    """
+    async def init_task():
+        global vector_db, vector_db_ready
+        try:
+            # Split lore into chunks with overlap
+            chunks = [LORE_TEXT[i : i + CHUNK_SIZE] for i in range(0, len(LORE_TEXT), CHUNK_STEP)]
+            embeddings = await load_or_compute_embeddings(chunks)
+            # Create or load collection
+            client     = chromadb.Client(Settings(persist_directory=PERSIST_DIR, is_persistent=True))
+            collection = client.get_or_create_collection(name="lore")
+            # Add documents if empty
+            if collection.count() == 0:
+                ids = [f"{ACTIVE_NAME}-chunk-{i}" for i in range(len(chunks))]
+                collection.add(ids=ids, documents=chunks, embeddings=embeddings)
+            vector_db = collection
+            vector_db_ready = True
+            logger.info(f"✅ Vector DB ready for {ACTIVE_NAME}")
+        except Exception as e:
+            logger.error(f"Vector DB initialisation failed: {e}")
+    # Schedule the initialisation task on the event loop
+    asyncio.create_task(init_task())
 
 
 # =========================
@@ -546,15 +621,18 @@ if LORE_TEXT.strip():
 def get_relevant_context(query: str) -> str:
     """
     Retrieve related context from the vector DB via similarity search.
-    Returns a newline‑separated string of the top documents. If the
-    vector DB is not initialised, an empty string is returned.
+    If the vector DB is not ready, returns an empty string. This
+    function uses a cached embedding for the query to avoid repeated
+    API calls for identical inputs.
     """
-    if not vector_db:
+    if not vector_db_ready or not vector_db:
         return ""
     try:
-        query_embedding = genai.embed_content(model=EMBED_MODEL, content=query)["embedding"]
-        results         = vector_db.query(query_embeddings=[query_embedding], n_results=TOP_K_CONTEXT)
-        docs            = results.get("documents", [[]])[0]
+        query_embedding = get_query_embedding(query)
+        if not query_embedding:
+            return ""
+        results = vector_db.query(query_embeddings=[query_embedding], n_results=TOP_K_CONTEXT)
+        docs    = results.get("documents", [[]])[0]
         return "\n".join(docs) if docs else ""
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
@@ -776,7 +854,7 @@ def health():
         "active_character": CHAR_NAME,
         "available_characters": list(CHARACTERS.keys()),
         "model": GEMINI_MODEL,
-        "vector_db": vector_db is not None,
+        "vector_db_ready": vector_db_ready,
     }
 
 
