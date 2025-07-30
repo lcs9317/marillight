@@ -440,7 +440,9 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
                     webhook_url,
                     {"reply": cached, "user_id": user_id}
                 )
-                return {"status": "processing", "message": "응답을 처리 중입니다"}
+                # KakaoTalk expects a single reply; return the cached answer
+                # immediately so the user sees a response. No separate status field.
+                return {"reply": cached}
             else:
                 return {"reply": cached}
 
@@ -453,7 +455,8 @@ async def kakao_bridge(request: Request, background_tasks: BackgroundTasks):
                 webhook_url,
                 cache_key
             )
-            return {"status": "processing", "message": "응답을 생성 중입니다"}
+            # 카카오채널은 단 한 번의 메시지만 전송할 수 있으므로 즉시 안내 메시지를 반환
+            return {"reply": "답변을 생성 중입니다. 잠시만 기다려 주세요."}
 
         # Otherwise generate a reply immediately
         response = await asyncio.get_event_loop().run_in_executor(
