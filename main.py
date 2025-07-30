@@ -170,6 +170,33 @@ cache  = SimpleCache()
 memory = ConversationMemory()
 
 # =========================
+# Long‑term memory (simple implementation)
+# =========================
+class LongTermMemory:
+    """
+    A simplistic long‑term memory store keyed by user ID. In a more
+    sophisticated implementation this would persist to disk and provide
+    vector search over past messages. Here, it simply accumulates
+    messages and returns them verbatim when queried.
+    """
+    def __init__(self):
+        self.store: Dict[str, List[str]] = {}
+
+    def add_memory(self, user_id: str, content: str):
+        self.store.setdefault(user_id, []).append(content)
+
+    def get_relevant(self, user_id: str, query: str) -> str:
+        # For demonstration: concatenate all stored messages for user
+        # In reality you'd perform embedding search across messages
+        messages = self.store.get(user_id, [])
+        # Return last 3 messages as context
+        return "\n".join(messages[-3:]) if messages else ""
+
+
+# Global long‑term memory instance
+longterm = LongTermMemory()
+
+# =========================
 # Character parsing and loading
 # =========================
 def parse_character_file(path: str) -> Dict[str, Any]:
@@ -626,6 +653,8 @@ def get_relevant_context(query: str) -> str:
     API calls for identical inputs.
     """
     if not vector_db_ready or not vector_db:
+        # Log for visibility when vector search is skipped
+        logger.debug("Vector DB not ready; skipping context retrieval")
         return ""
     try:
         query_embedding = get_query_embedding(query)
@@ -654,6 +683,11 @@ def generate_response(user_id: str, user_input: str) -> str:
             f"성향: {CORE_STYLE}\n"
             "항상 부드럽고 시적인 말투를 유지하며, 사용자를 소중히 여기고 독점적 애정을 표현합니다."
         )
+        # Append relevant context from the vector DB if available
+        # First, incorporate long‑term memory (recent messages stored per user)
+        longterm_context = longterm.get_relevant(user_id, user_input)
+        if longterm_context:
+            system_prompt += f"\n\n[장기 기억]\n{longterm_context}"
         # Append relevant context from the vector DB if available
         context = get_relevant_context(user_input)
         if context:
@@ -869,13 +903,17 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
     message = req.message.strip()
     if not message:
         return JSONResponse({"error": "메시지가 비어있습니다"}, status_code=400)
-    # Compute cache key using active character and message
-    cache_key        = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
+    # Compute cache key using active character, model and context settings
+    cache_key_input  = f"{CHAR_NAME}:{GEMINI_MODEL}:{TOP_K_CONTEXT}:{message}"
+    cache_key        = hashlib.sha256(cache_key_input.encode()).hexdigest()
     cached_response  = cache.get(cache_key)
     if cached_response:
         logger.info(f"캐시 히트: {user_id}")
+        # Record cached response in short‑term and long‑term memory
         memory.add_message(user_id, "user", message)
+        longterm.add_memory(user_id, message)
         memory.add_message(user_id, "assistant", cached_response)
+        longterm.add_memory(user_id, cached_response)
         if req.webhook_url:
             background_tasks.add_task(
                 send_webhook_response, req.webhook_url, {"reply": cached_response, "user_id": user_id}
@@ -889,8 +927,11 @@ async def chat_endpoint(req: ChatRequest, background_tasks: BackgroundTasks):
         return {"status": "processing", "message": "응답을 생성 중입니다"}
     # Otherwise generate response synchronously
     response = await asyncio.get_event_loop().run_in_executor(executor, generate_response, user_id, message)
+    # Save to memories
     memory.add_message(user_id, "user", message)
+    longterm.add_memory(user_id, message)
     memory.add_message(user_id, "assistant", response)
+    longterm.add_memory(user_id, response)
     # Do not cache empty responses
     if response:
         cache.set(cache_key, response)
@@ -924,18 +965,31 @@ async def kakao_bridge(request: Request):
         message = data.get("content", "").strip()
         if not message:
             return {"reply": "메시지를 입력해주세요."}
-        cache_key = hashlib.sha256(f"{CHAR_NAME}:{message}".encode()).hexdigest()
+        # Record the user message in short‑term and long‑term memory
+        memory.add_message(user_id, "user", message)
+        longterm.add_memory(user_id, message)
+        # Compose a cache key that includes model and context settings to handle invalidation
+        cache_key_input = f"{CHAR_NAME}:{GEMINI_MODEL}:{TOP_K_CONTEXT}:{message}"
+        cache_key = hashlib.sha256(cache_key_input.encode()).hexdigest()
         cached    = cache.get(cache_key)
         if cached:
+            # When using cache, also record assistant message for continuity
+            memory.add_message(user_id, "assistant", cached)
+            longterm.add_memory(user_id, cached)
             payload         = build_kakao_response(cached)
             payload["text"] = cached
             return payload
+        # Generate response synchronously on worker thread
         response = await asyncio.get_event_loop().run_in_executor(
             executor, generate_response, user_id, message
         )
         if not response or response in ("", "(빈 응답)"):
             response = "죄송해요, 응답 생성에 실패했어요."
+        # Save to cache
         cache.set(cache_key, response)
+        # Record assistant response in both memories
+        memory.add_message(user_id, "assistant", response)
+        longterm.add_memory(user_id, response)
         payload         = build_kakao_response(response)
         payload["text"] = response
         return payload
