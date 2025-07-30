@@ -681,7 +681,7 @@ def generate_response(user_id: str, user_input: str) -> str:
         system_prompt = (
             f"당신은 '{CHAR_NAME}'입니다. {BACKGROUND}\n"
             f"성향: {CORE_STYLE}\n"
-            "항상 부드럽고 시적인 말투를 유지하며, 사용자를 소중히 여기고 독점적 애정을 표현합니다."
+            "친근하고 자연스러운 말투로 대화하며, '~세요' 형태의 정중한 어미를 사용하세요."
         )
         # Append relevant context from the vector DB if available
         # First, incorporate long‑term memory (recent messages stored per user)
