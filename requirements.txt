@@ -1,8 +1,32 @@
+# Web Framework
 fastapi==0.104.1
-uvicorn==0.24.0  # standard 제외 (더 가벼움)
+uvicorn[standard]==0.24.0
+
+# JSON Processing (High Performance)
 orjson==3.9.10
+
+# Data Validation
 pydantic==2.5.0
+
+# AI/ML Libraries
 google-generativeai==0.3.2
-chromadb==0.4.18
+
+# NumPy - ChromaDB 호환 버전 (중요!)
+numpy>=1.21.0,<2.0.0
+
+# Vector Database - 안정 버전
+chromadb==0.4.15
+
+# Caching (Optional)
 redis==5.0.1
+
+# HTTP Client (for ChromaDB dependencies)
 httpx==0.25.2
+
+# Additional dependencies
+typing-extensions==4.8.0
+requests>=2.31.0
+sqlite3
+
+# 호환성을 위한 추가 패키지
+protobuf>=3.20.0,<4.0.0
