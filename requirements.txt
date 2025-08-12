@@ -1,13 +1,7 @@
-fastapi>=0.111.1
-uvicorn[standard]>=0.30.3
-httpx>=0.27.0
-orjson>=3.9.0
-
-# 임베딩(로컬, 가벼움)
-fastembed>=0.2.0
-numpy>=1.26.0
-scikit-learn>=1.4.0   # (옵션) TF-IDF 백업용
-
-# 선택: LLM 응답용
-openai>=1.30.0
-google-generativeai>=0.7.2
+fastapi==0.115.*
+uvicorn[standard]==0.30.*
+fastembed==0.5.2
+scikit-learn==1.5.*
+numpy==2.0.*
+openai>=1.40.0
+google-generativeai>=0.7.0
