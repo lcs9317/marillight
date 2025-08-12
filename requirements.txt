@@ -1,8 +1,16 @@
 fastapi==0.115.*
 uvicorn[standard]==0.30.*
+
+# 임베딩
 fastembed==0.7.1
 onnxruntime==1.18.*
-scikit-learn==1.5.*
-numpy==2.0.*
+
+# 핵심: NumPy 1.x로 고정 (ABI 충돌 해결)
+numpy==1.26.4
+
+# TF-IDF 백업용
+scikit-learn==1.4.2
+
+# 선택(LLM)
 openai>=1.40.0
 google-generativeai>=0.7.0
