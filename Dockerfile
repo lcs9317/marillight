@@ -33,7 +33,7 @@ RUN python - <<'PY'
 from main import build_index
 import os
 print("[build] precomputing embeddings/index ...")
-pack = build_index(os.environ.get("CHAR_DIR","./characters"), backend="emb")
+pack = build_index(os.environ.get("CHAR_DIR","./character"), backend="emb")
 print("[build] done: docs=", len(pack.docs))
 PY
 
