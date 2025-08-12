@@ -32,7 +32,7 @@ ENV (권장 기본값)
   LLM_TEMPERATURE=0.6
 """
 
-import os, re, glob, json, pickle, hashlib, time, math
+import os, re, glob, json, pickle, hashlib, time, math, unicodedata
 from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -119,8 +119,7 @@ def backoff_sleep(try_idx: int):
 
 # -------- persona helpers  [NEW] --------
 def _extract_section(raw: str, header: str) -> str:
-    pat = re.compile(rf"^\s*\[{re.escape(header)}\]\s*\n(.*?)(?=\n\s*\[|$)",
-                     re.DOTALL | re.MULTILINE)
+    pat = re.compile(rf"^\s*\[{re.escape(header)}\]\s*\n(.*?)(?=\n\s*\[|$)", re.DOTALL | re.MULTILINE)
     m = pat.search(raw)
     return (m.group(1).strip() if m else "").strip()
 
@@ -155,6 +154,38 @@ def _load_persona_from_files(char_dir: str, active_name: str) -> Tuple[str, str]
     keys    = re.sub(r"^\s*[-•]\s*", "- ", keys,    flags=re.MULTILINE)
     return persona, keys
 
+# -------- alias helpers  [NEW] --------
+def _norm(s: str) -> str:
+    return unicodedata.normalize("NFKC", s).strip().lower()
+
+def _parse_aliases(char_name: str, file_path: str) -> List[str]:
+    """파일의 '이름:' 줄과 파일명에서 별칭을 추출 (예: '페렐 (Ferrel)')"""
+    raw = read_text(file_path)
+    aliases = {char_name}
+    m = re.search(r"^이름\s*:\s*(.+)$", raw, re.MULTILINE)
+    if m:
+        name_line = m.group(1)
+        kor = re.sub(r"\(.*?\)", "", name_line).strip()
+        engs = re.findall(r"\(([^)]+)\)", name_line)
+        for tok in [kor, *engs]:
+            if tok:
+                aliases.add(tok)
+    base = os.path.splitext(os.path.basename(file_path))[0]
+    aliases.add(base)
+    return sorted({_norm(a) for a in aliases if a})
+
+def _resolve_char_from_query(q: str, alias_map: Dict[str, str]) -> Optional[str]:
+    """질의에서 별칭을 감지해 캐릭터 이름을 반환"""
+    nq = _norm(q)
+    tokens = re.split(r"[^0-9A-Za-z가-힣_]+", nq)
+    for t in tokens + [nq]:
+        if not t:
+            continue
+        for alias in sorted(alias_map.keys(), key=len, reverse=True):
+            if alias and alias in t:
+                return alias_map[alias]
+    return None
+
 # =========================
 # Remote embeddings
 # =========================
@@ -186,6 +217,22 @@ def _embed_remote_gemini(texts: List[str]) -> List[List[float]]:
             emb = emb["values"]
         out.append(emb)
     return out
+
+def _gemini_embed_query(q: str) -> List[float]:
+    """질의 전용 임베딩 (retrieval_query)  # [NEW]"""
+    import google.generativeai as genai
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+    genai.configure(api_key=key)
+    model = os.environ.get("GEMINI_EMBED_MODEL", GEMINI_EMBED_MODEL)
+    if not model.startswith("models/"):
+        model = f"models/{model}"
+    r = genai.embed_content(model=model, content=q, task_type="retrieval_query")
+    emb = r.get("embedding")
+    if isinstance(emb, dict) and "values" in emb:
+        emb = emb["values"]
+    return emb
 
 def embed_remote(texts: List[str]) -> List[List[float]]:
     fn = _embed_remote_gemini if EMBED_PROVIDER == "gemini" else _embed_remote_openai
@@ -280,7 +327,10 @@ class Retriever:
 
     def _q_embed(self, q: str):
         import numpy as np
-        qv = np.asarray(embed_remote([q])[0], dtype=np.float32)
+        if self.provider == "gemini":
+            qv = np.asarray(_gemini_embed_query(q), dtype=np.float32)  # [NEW]
+        else:
+            qv = np.asarray(embed_remote([q])[0], dtype=np.float32)
         qv /= (np.linalg.norm(qv) + 1e-12)
         return qv
 
@@ -307,6 +357,8 @@ class IndexPack:
     retriever: Retriever
     finger: str
     active: str
+    char_to_idxs: Dict[str, List[int]]      # [NEW] 캐릭터 -> 청크 인덱스
+    alias_to_char: Dict[str, str]           # [NEW] 별칭 -> 캐릭터
 
 def _clear_cache_if_needed():
     if not CLEAR_CACHE:
@@ -357,9 +409,25 @@ def build_index(char_dir: str) -> IndexPack:
     retr = Retriever()
     retr.fit(docs, ids, metas)
 
+    # [NEW] 캐릭터 -> 청크 인덱스
+    char_to_idxs: Dict[str, List[int]] = {}
+    for i, m in enumerate(metas):
+        char_to_idxs.setdefault(m["char"], []).append(i)
+
+    # [NEW] 별칭 -> 캐릭터 (파일당 1회만 별칭 추출)
+    alias_to_char: Dict[str, str] = {}
+    seen_file_for: Dict[str, str] = {}
+    for m in metas:
+        c = m["char"]
+        if c in seen_file_for:
+            continue
+        seen_file_for[c] = m["path"]
+        for a in _parse_aliases(c, m["path"]):
+            alias_to_char[a] = c
+
     names = sorted({m["char"] for m in metas})
     active = choose_active_name(names)
-    return IndexPack(docs, ids, metas, retr, CURRENT_FINGER, active)
+    return IndexPack(docs, ids, metas, retr, CURRENT_FINGER, active, char_to_idxs, alias_to_char)
 
 # =====================
 # Optional LLM for answers (선택)
@@ -485,11 +553,33 @@ def chat(req: ChatReq):
     if PACK is None:
         return {"ok": False, "answer": "", "contexts": []}
     k = req.top_k or TOP_K_DEFAULT
+
+    # [NEW] 0) 질의에서 캐릭터 이름/별칭 감지 → 해당 캐릭터 대표 청크 우선 삽입
+    picked_docs: List[str] = []
+    picked_meta: List[Dict[str, Any]] = []
+    char = _resolve_char_from_query(req.query, PACK.alias_to_char)
+    if char:
+        for i in PACK.char_to_idxs.get(char, [])[:max(3, k // 2 or 1)]:
+            picked_docs.append(PACK.docs[i])
+            picked_meta.append({
+                "score": 1.5,  # 이름 직매칭 가산
+                "id": PACK.ids[i],
+                "char": PACK.metas[i]["char"],
+                "chunk": PACK.metas[i]["chunk"],
+            })
+
+    # 1) 벡터 검색
     hits = PACK.retriever.query(req.query, top_k=k)
-    ctx_docs = [h[1]["text"] for h in hits]
+    ctx_docs = picked_docs + [h[1]["text"] for h in hits]
+
+    # 2) 생성
     answer = generate_answer(ctx_docs, req.query)
-    results = [
+
+    # 3) 컨텍스트 결합(중복 제거) 및 상위 k로 제한
+    seen = set(x["id"] for x in picked_meta)
+    tail = [
         {"score": float(h[0]), "id": h[1]["id"], "char": h[1]["meta"]["char"], "chunk": h[1]["meta"]["chunk"]}
-        for h in hits
+        for h in hits if h[1]["id"] not in seen
     ]
-    return {"ok": True, "answer": answer, "contexts": results}
+    results = picked_meta + tail
+    return {"ok": True, "answer": answer, "contexts": results[:k]}
