@@ -1,27 +1,20 @@
-# Base
 FROM python:3.11-slim
 WORKDIR /app
 
-# System deps (slim)
+# System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-# Python deps
-RUN pip install --no-cache-dir \
-    "fastapi==0.115.*" \
-    "uvicorn[standard]==0.30.*" \
-    "fastembed==0.5.2" \
-    "scikit-learn==1.5.*" \
-    "numpy==2.0.*" \
-    "openai>=1.40.0" \
-    "google-generativeai>=0.7.0"
+# ---- Python deps via requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# App files
+# ---- App files
 COPY main.py /app/main.py
 RUN mkdir -p /app/character
 COPY *.txt /app/character/
 
-# Defaults (Koyeb에서 ENV로 얼마든지 덮어쓸 수 있음)
+# ---- Defaults (Koyeb에서 ENV로 덮어써도 됨)
 ENV PORT=8000 \
     CHAR_DIR=/app/character \
     CACHE_DIR=/app/cache \
@@ -49,7 +42,7 @@ TextEmbedding(model_name=m, cache_dir=os.environ.get("HF_HOME","/opt/hf"))
 print(">> cached fastembed model:", m)
 PY
 
-# Non-root
+# 비루트 실행 권장
 RUN useradd -m appuser && chown -R appuser:appuser /app /opt/hf
 USER appuser
 
