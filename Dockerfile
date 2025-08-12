@@ -26,6 +26,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # ---- Python deps ----
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip && \
+    pip install --no-cache-dir "numpy==1.26.4" && \
     pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- App source ----
