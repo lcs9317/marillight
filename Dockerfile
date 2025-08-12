@@ -15,7 +15,7 @@ COPY main.py /app/main.py
 
 # 캐릭터 리소스 폴더 생성 후 *.txt 복사
 RUN mkdir -p /app/character
-COPY *.txt /app/character/
+COPY /character/*.txt /app/character/
 # requirements.txt가 섞여 들어오는 걸 방지
 RUN rm -f /app/character/requirements.txt
 
