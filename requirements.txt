@@ -1,6 +1,7 @@
 fastapi==0.115.*
 uvicorn[standard]==0.30.*
 fastembed==0.7.1
+onnxruntime==1.18.*
 scikit-learn==1.5.*
 numpy==2.0.*
 openai>=1.40.0
