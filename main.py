@@ -25,7 +25,7 @@ TOP_K_DEFAULT    = int(os.environ.get("TOP_K", "4"))
 ACTIVE_NAME_HINT = os.environ.get("CURRENT_CHARACTER", "마릴라이트|Marillight")
 
 # fastembed 임베딩 모델 (다국어 권장: e5-base)
-EMB_MODEL        = os.environ.get("EMB_MODEL", "intfloat/multilingual-e5-base")
+EMB_MODEL        = os.environ.get("EMB_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 EMB_BATCH        = int(os.environ.get("EMB_BATCH", "32"))  # fastembed는 내부 배치 관리, 값은 의미 없음
 
 # LLM 선택(없어도 동작)
