@@ -13,6 +13,8 @@ from pydantic import BaseModel
 CHAR_DIR         = os.environ.get("CHAR_DIR", "./characters")
 CACHE_DIR        = os.environ.get("CACHE_DIR", "./cache")
 INDEX_CACHE      = os.path.join(CACHE_DIR, "index.pkl")
+EMB_CACHE        = os.path.join(CACHE_DIR, "embeddings.npy")   # <--- 추가: 임베딩 캐시
+META_CACHE       = os.path.join(CACHE_DIR, "meta.json")        # <--- 추가: 임베딩 메타
 
 # 임베딩 기본 ON (필요시만 TF-IDF로 내릴 수 있게 스위치 유지)
 USE_EMB_ENV      = os.environ.get("USE_EMBEDDINGS", "1")
@@ -24,7 +26,7 @@ CHUNK_OVERLAP    = int(os.environ.get("CHUNK_OVERLAP", "250"))
 TOP_K_DEFAULT    = int(os.environ.get("TOP_K", "4"))
 ACTIVE_NAME_HINT = os.environ.get("CURRENT_CHARACTER", "마릴라이트|Marillight")
 
-# fastembed 임베딩 모델 (다국어 권장: e5-base)
+# fastembed 임베딩 모델 (다국어 권장)
 EMB_MODEL        = os.environ.get("EMB_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 EMB_BATCH        = int(os.environ.get("EMB_BATCH", "32"))  # fastembed는 내부 배치 관리, 값은 의미 없음
 
@@ -178,14 +180,19 @@ class Retriever:
         self.vectorizer = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.95)
         self.matrix = self.vectorizer.fit_transform(self.docs)
 
+    def _lazy_load_model(self):
+        if self.model is None:
+            from fastembed import TextEmbedding
+            cache_dir = os.environ.get("HF_HOME", "/tmp/hf")
+            self.model = TextEmbedding(model_name=EMB_MODEL, cache_dir=cache_dir)
+
     def _fit_fastembed(self):
         import numpy as np
         from fastembed import TextEmbedding
-        cache_dir = os.environ.get("HF_HOME", "/tmp/hf")  # 모델 캐시 위치 (이미지 크기↑ 방지)
+        cache_dir = os.environ.get("HF_HOME", "/tmp/hf")
         self.model = TextEmbedding(model_name=EMB_MODEL, cache_dir=cache_dir)
         vecs = list(self.model.embed(self.docs))  # generator -> list
         emb = np.asarray(vecs, dtype=np.float32)
-        # L2 normalize
         norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
         self.emb = emb / norms
 
@@ -198,6 +205,8 @@ class Retriever:
             return [(float(scores[i]), {"id": self.ids[i], "meta": self.metas[i], "text": self.docs[i]}) for i in idx]
         else:
             import numpy as np
+            # ---- 지연 로딩: 서버 시작 시 모델 미로드
+            self._lazy_load_model()
             qv = list(self.model.embed([q]))[0]
             qv = np.asarray(qv, dtype=np.float32)
             qv = qv / (np.linalg.norm(qv) + 1e-12)
@@ -227,6 +236,7 @@ def choose_active_name(all_names: List[str]) -> str:
         return all_names[0] if all_names else "마릴라이트"
 
 def build_index(char_dir: str, backend="emb") -> IndexPack:
+    import numpy as np
     paths = glob.glob(os.path.join(char_dir, "*.txt"))
     if not paths:
         raise FileNotFoundError(f"캐릭터 파일(.txt)이 없습니다: {char_dir}")
@@ -259,7 +269,29 @@ def build_index(char_dir: str, backend="emb") -> IndexPack:
             pickle.dump({"docs": docs, "ids": ids, "metas": metas, "finger": finger}, f)
 
     retr = Retriever(backend=backend)
-    retr.fit(docs, ids, metas)
+
+    # ---- 임베딩 캐시가 있으면 mmap 으로 로드(메모리 절약)하고 학습 생략
+    if backend == "emb" and os.path.isfile(EMB_CACHE) and os.path.isfile(META_CACHE):
+        try:
+            meta = json.load(open(META_CACHE, "r", encoding="utf-8"))
+            if meta.get("finger") == finger:
+                retr.docs, retr.ids, retr.metas = docs, ids, metas
+                retr.emb = np.load(EMB_CACHE, mmap_mode="r")
+                names = sorted({m["char"] for m in metas})
+                active = choose_active_name(names)
+                return IndexPack(backend, docs, ids, metas, retr, finger, active)
+        except Exception:
+            pass
+
+    # ---- 최초 1회만 임베딩 생성 후 캐시 저장
+    if backend == "tfidf":
+        retr.fit(docs, ids, metas)
+    else:
+        retr.fit(docs, ids, metas)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        np.save(EMB_CACHE, retr.emb)
+        with open(META_CACHE, "w", encoding="utf-8") as f:
+            json.dump({"finger": finger, "dim": int(retr.emb.shape[1])}, f)
 
     names = sorted({m["char"] for m in metas})
     active = choose_active_name(names)
@@ -295,7 +327,6 @@ def generate_with_gemini(sys_prompt: str, context: str, user: str) -> str:
     return resp.text
 
 def fallback_generate(sys_prompt: str, context: str, user: str) -> str:
-    # 키가 없으면 간단 요약형으로라도 응답
     snippet = "\n".join([l for l in context.splitlines() if l.strip()][:10])
     return (
         "아키텍트님, 관련 정보를 요약해보겠습니다.\n\n"
