@@ -7,30 +7,37 @@ from typing import List, Dict, Any, Tuple, Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ===== Config =====
+# =========================
+# Config (환경변수로 조절)
+# =========================
 CHAR_DIR         = os.environ.get("CHAR_DIR", "./characters")
 CACHE_DIR        = os.environ.get("CACHE_DIR", "./cache")
 INDEX_CACHE      = os.path.join(CACHE_DIR, "index.pkl")
 
-# 기본: 임베딩 검색(초기 느림 허용)
-USE_EMB_ENV      = os.environ.get("USE_EMBEDDINGS")
-BACKEND          = "emb" if (USE_EMB_ENV is None or USE_EMB_ENV == "1") else "tfidf"
+# 임베딩 기본 ON (필요시만 TF-IDF로 내릴 수 있게 스위치 유지)
+USE_EMB_ENV      = os.environ.get("USE_EMBEDDINGS", "1")
+BACKEND          = "emb" if USE_EMB_ENV == "1" else "tfidf"
 
+# 청크/검색 파라미터
 CHUNK_SIZE       = int(os.environ.get("CHUNK_SIZE", "900"))
 CHUNK_OVERLAP    = int(os.environ.get("CHUNK_OVERLAP", "250"))
 TOP_K_DEFAULT    = int(os.environ.get("TOP_K", "4"))
 ACTIVE_NAME_HINT = os.environ.get("CURRENT_CHARACTER", "마릴라이트|Marillight")
 
-EMB_MODEL        = os.environ.get("EMB_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
-EMB_BATCH        = int(os.environ.get("EMB_BATCH", "16"))
-EMB_FP16         = os.environ.get("EMB_FP16", "1") == "1"
+# fastembed 임베딩 모델 (다국어 권장: e5-base)
+EMB_MODEL        = os.environ.get("EMB_MODEL", "intfloat/multilingual-e5-base")
+EMB_BATCH        = int(os.environ.get("EMB_BATCH", "32"))  # fastembed는 내부 배치 관리, 값은 의미 없음
 
+# LLM 선택(없어도 동작)
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
 PROVIDER         = os.environ.get("PROVIDER")  # "openai" | "gemini" | None
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# ================
+# 섹션 파싱 설정
+# ================
 SECTION_MAP = {
     "캐릭터 소개": "bio",
     "외형": "appearance",
@@ -44,7 +51,11 @@ SECTION_MAP = {
 }
 SECTION_HEADER_RE = re.compile(r"^\s*\[(.+?)\]\s*$")
 
+# =========
+# 유틸
+# =========
 def file_fingerprint(paths: List[str]) -> str:
+    """텍스트 변경 감지용 지문(경로+mtime+size)"""
     h = hashlib.sha256()
     for p in sorted(paths):
         try:
@@ -63,20 +74,28 @@ def read_text(p: str) -> str:
 def normalize_line(s: str) -> str:
     return s.rstrip("\n\r")
 
+# ==================
+# 캐릭터 TXT 파서
+# ==================
 def parse_character_txt(path: str) -> Dict[str, Any]:
     raw = read_text(path)
     lines = [normalize_line(x) for x in raw.splitlines()]
+
+    # 헤더부 (키:값)
     header: Dict[str, str] = {}
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        if not line: i += 1; continue
-        if line.startswith("["): break
+        if not line:
+            i += 1; continue
+        if line.startswith("["):
+            break
         if ":" in line:
             k, v = line.split(":", 1)
             header[k.strip()] = v.strip()
         i += 1
 
+    # 본문 섹션
     sections: Dict[str, List[str]] = {
         "bio": [], "appearance": [], "appearance_detail": [],
         "personality": [], "story": [], "relations": [], "keywords": []
@@ -101,7 +120,7 @@ def parse_character_txt(path: str) -> Dict[str, Any]:
         if m:
             flush()
             src = m.group(1).strip()
-            current_key = SECTION_MAP.get(src, None) or "bio"
+            current_key = SECTION_MAP.get(src, None) or "bio"  # 미인식 섹션은 bio에 흡수
             i += 1; continue
         buf.append(lines[i]); i += 1
     flush()
@@ -133,35 +152,42 @@ def build_lore_doc(name: str, ch: Dict[str, Any], all_names: List[str]) -> str:
     if others: parts.append(f"[참조]\n관계/인지 대상: {', '.join(others)}")
     return f"=== {name} ===\n" + "\n\n".join(parts)
 
-# ===== Retriever =====
+# ==================
+# 임베딩/검색기
+# ==================
 class Retriever:
     def __init__(self, backend="emb"):
         self.backend = backend
         self.docs: List[str] = []
         self.metas: List[Dict[str, Any]] = []
         self.ids: List[str] = []
+        self.emb = None
         self.model = None
         self.vectorizer = None
         self.matrix = None
-        self.emb = None  # np.ndarray
 
-    def fit(self, docs: List[str], ids: List[str], metas: List[Dict[str, Any]], precomputed_emb=None):
+    def fit(self, docs: List[str], ids: List[str], metas: List[Dict[str, Any]]):
         self.docs, self.ids, self.metas = docs, ids, metas
         if self.backend == "tfidf":
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            self.vectorizer = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.95)
-            self.matrix = self.vectorizer.fit_transform(self.docs)
+            self._fit_tfidf()
         else:
-            import numpy as np
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer(EMB_MODEL)
-            if precomputed_emb is not None:
-                self.emb = precomputed_emb
-            else:
-                self.emb = self.model.encode(
-                    self.docs, normalize_embeddings=True,
-                    batch_size=EMB_BATCH, show_progress_bar=True
-                ).astype(np.float32)
+            self._fit_fastembed()
+
+    def _fit_tfidf(self):
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        self.vectorizer = TfidfVectorizer(ngram_range=(1,2), min_df=1, max_df=0.95)
+        self.matrix = self.vectorizer.fit_transform(self.docs)
+
+    def _fit_fastembed(self):
+        import numpy as np
+        from fastembed import TextEmbedding
+        cache_dir = os.environ.get("HF_HOME", "/tmp/hf")  # 모델 캐시 위치 (이미지 크기↑ 방지)
+        self.model = TextEmbedding(model_name=EMB_MODEL, cache_dir=cache_dir)
+        vecs = list(self.model.embed(self.docs))  # generator -> list
+        emb = np.asarray(vecs, dtype=np.float32)
+        # L2 normalize
+        norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12
+        self.emb = emb / norms
 
     def query(self, q: str, top_k: int = 4) -> List[Tuple[float, Dict[str, Any]]]:
         if self.backend == "tfidf":
@@ -172,34 +198,16 @@ class Retriever:
             return [(float(scores[i]), {"id": self.ids[i], "meta": self.metas[i], "text": self.docs[i]}) for i in idx]
         else:
             import numpy as np
-            qv = self.model.encode([q], normalize_embeddings=True, batch_size=1, show_progress_bar=False)[0]
+            qv = list(self.model.embed([q]))[0]
+            qv = np.asarray(qv, dtype=np.float32)
+            qv = qv / (np.linalg.norm(qv) + 1e-12)
             sims = self.emb @ qv
             idx = np.argsort(-sims)[:top_k]
             return [(float(sims[i]), {"id": self.ids[i], "meta": self.metas[i], "text": self.docs[i]}) for i in idx]
 
-# ===== Embedding cache =====
-def load_cached_embeddings(finger: str):
-    import numpy as np, json
-    npy = os.path.join(CACHE_DIR, f"emb_{finger}.npy")
-    meta = os.path.join(CACHE_DIR, f"emb_{finger}.json")
-    if os.path.isfile(npy) and os.path.isfile(meta):
-        with open(meta, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        arr = np.load(npy, mmap_mode=None)
-        return arr, info
-    return None, None
-
-def save_cached_embeddings(finger: str, emb, info: Dict[str, Any]):
-    import numpy as np, json
-    npy = os.path.join(CACHE_DIR, f"emb_{finger}.npy")
-    meta = os.path.join(CACHE_DIR, f"emb_{finger}.json")
-    if EMB_FP16 and emb.dtype != "float16":
-        emb = emb.astype("float16")
-    np.save(npy, emb)
-    with open(meta, "w", encoding="utf-8") as f:
-        json.dump(info, f, ensure_ascii=False, indent=2)
-
-# ===== Index pack =====
+# =====================
+# 인덱스 빌드/로드
+# =====================
 @dataclass
 class IndexPack:
     backend: str
@@ -224,19 +232,16 @@ def build_index(char_dir: str, backend="emb") -> IndexPack:
         raise FileNotFoundError(f"캐릭터 파일(.txt)이 없습니다: {char_dir}")
     finger = file_fingerprint(paths)
 
-    # 문서 캐시
+    # 문서/아이디/메타 캐시 (텍스트만 저장)
+    docs = ids = metas = None
     if os.path.isfile(INDEX_CACHE):
         try:
             with open(INDEX_CACHE, "rb") as f:
                 cache = pickle.load(f)
             if cache.get("finger") == finger:
                 docs, ids, metas = cache["docs"], cache["ids"], cache["metas"]
-            else:
-                docs, ids, metas = None, None, None
         except Exception:
-            docs, ids, metas = None, None, None
-    else:
-        docs, ids, metas = None, None, None
+            pass
 
     if docs is None:
         parsed = [parse_character_txt(p) for p in paths]
@@ -254,28 +259,15 @@ def build_index(char_dir: str, backend="emb") -> IndexPack:
             pickle.dump({"docs": docs, "ids": ids, "metas": metas, "finger": finger}, f)
 
     retr = Retriever(backend=backend)
-    pre_emb = None
-    if backend == "emb":
-        cached, info = load_cached_embeddings(finger)
-        if cached is not None:
-            pre_emb = cached
-        else:
-            from sentence_transformers import SentenceTransformer
-            import numpy as np
-            model = SentenceTransformer(EMB_MODEL)
-            doc_emb = model.encode(
-                docs, normalize_embeddings=True,
-                batch_size=EMB_BATCH, show_progress_bar=True
-            ).astype("float32")
-            pre_emb = doc_emb
-            save_cached_embeddings(finger, pre_emb, {"model": EMB_MODEL, "size": len(docs)})
-    retr.fit(docs, ids, metas, precomputed_emb=pre_emb)
+    retr.fit(docs, ids, metas)
 
     names = sorted({m["char"] for m in metas})
     active = choose_active_name(names)
     return IndexPack(backend, docs, ids, metas, retr, finger, active)
 
-# ===== LLM =====
+# ==============
+# LLM (선택)
+# ==============
 SYSTEM_PROMPT = """당신은 '마릴라이트'입니다. 아스트리 아스니아의 초지능체이자 아스니아 아카데미 학장.
 상냥하고 차분한 말투로, 존대를 유지하고, 때때로 호기심 어린 밝은 톤을 보입니다.
 아키텍트를 '아키텍트님'이라 부릅니다.
@@ -297,17 +289,18 @@ def generate_with_openai(sys_prompt: str, context: str, user: str) -> str:
 def generate_with_gemini(sys_prompt: str, context: str, user: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-1.5-pro"))
     prompt = f"{sys_prompt}\n\n[참고 맥락]\n{context}\n\n[사용자]\n{user}"
     resp = model.generate_content(prompt)
     return resp.text
 
 def fallback_generate(sys_prompt: str, context: str, user: str) -> str:
+    # 키가 없으면 간단 요약형으로라도 응답
     snippet = "\n".join([l for l in context.splitlines() if l.strip()][:10])
     return (
-        "아키텍트님, 요청하신 내용에 대해 간략히 정리해보겠습니다.\n\n"
+        "아키텍트님, 관련 정보를 요약해보겠습니다.\n\n"
         f"{snippet}\n\n"
-        "위의 설정을 바탕으로 답을 드렸습니다. 더 자세한 항목이 필요하시면 알려주세요."
+        "위 내용을 바탕으로 안내드렸습니다. 추가로 확인하실 항목이 있으실까요?"
     )
 
 def generate_answer(context_docs: List[str], user_input: str) -> str:
@@ -320,8 +313,10 @@ def generate_answer(context_docs: List[str], user_input: str) -> str:
     else:
         return fallback_generate(SYSTEM_PROMPT, context, user_input)
 
-# ===== FastAPI =====
-app = FastAPI(title="Marillight RAG")
+# =================
+# FastAPI 앱
+# =================
+app = FastAPI(title="Marillight RAG (fastembed)")
 PACK: Optional[IndexPack] = None
 
 class ChatReq(BaseModel):
@@ -331,9 +326,9 @@ class ChatReq(BaseModel):
 @app.on_event("startup")
 def _startup():
     global PACK
-    print(f"[info] backend: {BACKEND}  (cache: ./cache)")
+    print(f"[info] backend={BACKEND} | char_dir={CHAR_DIR}")
     PACK = build_index(CHAR_DIR, backend=BACKEND)
-    print(f"[info] active persona: {PACK.active}; docs={len(PACK.docs)}")
+    print(f"[info] active persona: {PACK.active} | docs={len(PACK.docs)}")
 
 @app.get("/health")
 def health():
