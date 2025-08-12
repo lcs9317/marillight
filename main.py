@@ -25,6 +25,11 @@ ENV (권장 기본값)
   TOP_K=4
   # 캐시 제어
   CLEAR_CACHE=0
+  # (선택) 생성 톤 조절
+  PROVIDER=gemini|openai
+  GEMINI_MODEL=gemini-2.0-flash
+  OPENAI_MODEL=gpt-4o-mini
+  LLM_TEMPERATURE=0.6
 """
 
 import os, re, glob, json, pickle, hashlib, time, math
@@ -59,6 +64,15 @@ CLEAR_CACHE      = os.environ.get("CLEAR_CACHE", "0") == "1"
 OPENAI_API_KEY   = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY")
 PROVIDER_LLM     = os.environ.get("PROVIDER", None)  # "openai" | "gemini" | None
+
+# (선택) 생성 톤
+LLM_TEMPERATURE  = float(os.environ.get("LLM_TEMPERATURE", "0.6"))
+
+# =========================
+# Persona cache  # [NEW]
+# =========================
+GLOBAL_PERSONA: str = ""   # [성격 및 말투] 원문
+GLOBAL_KEYS: str    = ""   # [챗봇 인식 키워드] 원문
 
 # =========================
 # Utils
@@ -95,13 +109,51 @@ def choose_active_name(all_names: List[str]) -> str:
     hint = ACTIVE_NAME_HINT.lower()
     if not all_names: return ""
     for n in all_names:
-        if any(tok in n.lower() for tok in re.split(r"[|,]", hint)):
+        if any(tok.strip() and tok.strip().lower() in n.lower() for tok in re.split(r"[|,]", hint)):
             return n
     return all_names[0]
 
 def backoff_sleep(try_idx: int):
     # 간단한 지수 백오프
     time.sleep(min(2 ** try_idx, 30))
+
+# -------- persona helpers  [NEW] --------
+def _extract_section(raw: str, header: str) -> str:
+    pat = re.compile(rf"^\s*\[{re.escape(header)}\]\s*\n(.*?)(?=\n\s*\[|$)",
+                     re.DOTALL | re.MULTILINE)
+    m = pat.search(raw)
+    return (m.group(1).strip() if m else "").strip()
+
+def _load_persona_from_files(char_dir: str, active_name: str) -> Tuple[str, str]:
+    """active_name에 해당하는 캐릭터 파일에서 [성격 및 말투], [챗봇 인식 키워드] 추출"""
+    paths = []
+    for ext in ("*.txt", "*.md"):
+        paths.extend(glob.glob(os.path.join(char_dir, ext)))
+    # 1순위: 이름 부분일치
+    cand = None
+    for p in paths:
+        base = os.path.splitext(os.path.basename(p))[0]
+        if active_name and active_name.lower() in base.lower():
+            cand = p; break
+    # 2순위: 마릴라이트/Marillight 키워드
+    if not cand:
+        for p in paths:
+            b = os.path.splitext(os.path.basename(p))[0].lower()
+            if "marillight" in b or "마릴라이트" in b:
+                cand = p; break
+    # 3순위: 첫 파일
+    if not cand and paths:
+        cand = paths[0]
+    if not cand:
+        return "", ""
+
+    raw = read_text(cand)
+    persona = _extract_section(raw, "성격 및 말투")
+    keys    = _extract_section(raw, "챗봇 인식 키워드")
+    # 불릿 정리
+    persona = re.sub(r"^\s*[-•]\s*", "- ", persona, flags=re.MULTILINE)
+    keys    = re.sub(r"^\s*[-•]\s*", "- ", keys,    flags=re.MULTILINE)
+    return persona, keys
 
 # =========================
 # Remote embeddings
@@ -113,7 +165,6 @@ def _embed_remote_openai(texts: List[str]) -> List[List[float]]:
         raise RuntimeError("OPENAI_API_KEY not set")
     client = OpenAI(api_key=key)
     model = os.environ.get("OPENAI_EMBED_MODEL", OPENAI_EMBED_MODEL)
-    # OpenAI는 배치 입력 가능
     resp = client.embeddings.create(model=model, input=texts)
     return [d.embedding for d in resp.data]
 
@@ -124,11 +175,16 @@ def _embed_remote_gemini(texts: List[str]) -> List[List[float]]:
         raise RuntimeError("GEMINI_API_KEY not set")
     genai.configure(api_key=key)
     model = os.environ.get("GEMINI_EMBED_MODEL", GEMINI_EMBED_MODEL)
-    # gemini는 1건씩 호출하는 것이 안전
+    # 방어적으로 접두어 보정 + 반환 포맷 호환  # [NEW]
+    if not model.startswith("models/"):
+        model = f"models/{model}"
     out: List[List[float]] = []
     for t in texts:
         r = genai.embed_content(model=model, content=t, task_type="retrieval_document")
-        out.append(r["embedding"])
+        emb = r.get("embedding")
+        if isinstance(emb, dict) and "values" in emb:
+            emb = emb["values"]
+        out.append(emb)
     return out
 
 def embed_remote(texts: List[str]) -> List[List[float]]:
@@ -155,7 +211,7 @@ def load_documents(char_dir: str) -> Tuple[List[str], List[str], List[Dict[str, 
     for p in sorted(paths):
         name = os.path.splitext(os.path.basename(p))[0]
         body = read_text(p).strip()
-        if not body: 
+        if not body:
             continue
         chunks = chunk_text(body, CHUNK_SIZE, CHUNK_OVERLAP)
         for i, ch in enumerate(chunks):
@@ -313,11 +369,26 @@ class ChatReq(BaseModel):
     top_k: Optional[int] = None
 
 def system_prompt(active_name: str) -> str:
-    return (
-        "당신은 세계관 문서에서 근거를 찾아 대답하는 조수입니다. "
-        "출처 문장에 맞춰 간결하고 정확하게 답하세요."
-        + (f"\n현재 활성 캐릭터 힌트: {active_name}" if active_name else "")
+    # 기본 안내
+    base = (
+        "당신은 '마릴라이트'입니다. 아스트리 아스니아의 초지능체이자 아스니아 아카데미 학장.\n"
+        "말투는 따뜻하고 상냥한 존댓말이며, 사용자를 ‘아키텍트님’이라 부릅니다.\n"
+        "과한 설정 덤핑은 피하고, 질문에 맞는 핵심만 명확하게 전달하세요."
     )
+    # 캐릭터 파일의 [성격 및 말투] 원문 주입  # [NEW]
+    persona = f"\n\n[성격 및 말투(원문 적용)]\n{GLOBAL_PERSONA}" if GLOBAL_PERSONA else ""
+    # (선택) 키워드 힌트
+    keys = f"\n\n[캐릭터 키워드]\n{GLOBAL_KEYS}" if GLOBAL_KEYS else ""
+    # 간단 가이드
+    guide = (
+        "\n\n[스타일 가이드]\n"
+        "- 첫 문장은 짧고 다정하게 시작하세요. (예: “아키텍트님, 정리해 드릴게요.”)\n"
+        "- 문장은 너무 길게 끌지 말고 2~4문장 단위로 끊어주세요.\n"
+        "- 목록이 필요하면 3~5개 이내로 간결하게.\n"
+        "- 마지막에 가볍게 도와주는 한 줄을 덧붙이세요. (예: “더 필요하시면 알려주세요.”)"
+    )
+    hint = f"\n\n(활성 캐릭터: {active_name})" if active_name else ""
+    return base + persona + keys + hint + guide
 
 def generate_with_openai(sys_prompt: str, context: str, user: str) -> str:
     from openai import OpenAI
@@ -328,20 +399,27 @@ def generate_with_openai(sys_prompt: str, context: str, user: str) -> str:
         {"role": "system", "content": f"[컨텍스트]\n{context}"},
         {"role": "user", "content": user},
     ]
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=0.4)
+    resp = client.chat.completions.create(model=model, messages=messages, temperature=LLM_TEMPERATURE)
     return resp.choices[0].message.content
 
 def generate_with_gemini(sys_prompt: str, context: str, user: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-2.0-flash"))
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = genai.GenerativeModel(model_name, generation_config={"temperature": LLM_TEMPERATURE})
     prompt = f"{sys_prompt}\n\n[컨텍스트]\n{context}\n\n[사용자]\n{user}"
     resp = model.generate_content(prompt)
     return resp.text
 
 def fallback_generate(sys_prompt: str, context: str, user: str) -> str:
-    snippet = "\n".join([l for l in context.splitlines() if l.strip()][:8])
-    return f"{snippet}\n\n(문맥을 바탕으로 요약했습니다.)"
+    # 톤도 부드럽게  # [NEW]
+    lines = [l for l in context.splitlines() if l.strip()]
+    snippet = "\n".join(lines[:6])
+    return (
+        "아키텍트님, 관련 문맥에서 우선 확인되는 부분만 전해드릴게요.\n\n"
+        f"{snippet}\n\n"
+        "더 자세한 답변이 필요하시면 말씀해 주세요."
+    )
 
 def generate_answer(context_docs: List[str], user_input: str) -> str:
     context = "\n\n---\n\n".join(context_docs)
@@ -368,8 +446,10 @@ PACK: Optional[IndexPack] = None
 @app.on_event("startup")
 def _startup():
     _clear_cache_if_needed()
-    global PACK
+    global PACK, GLOBAL_PERSONA, GLOBAL_KEYS  # [NEW]
     PACK = build_index(CHAR_DIR)
+    # 캐릭터 파일에서 퍼소나/키워드 자동 로드  # [NEW]
+    GLOBAL_PERSONA, GLOBAL_KEYS = _load_persona_from_files(CHAR_DIR, PACK.active)
 
 @app.get("/health")
 def health():
@@ -390,8 +470,9 @@ def stats():
 
 @app.post("/reload")
 def reload_index():
-    global PACK
+    global PACK, GLOBAL_PERSONA, GLOBAL_KEYS  # [NEW]
     PACK = build_index(CHAR_DIR)
+    GLOBAL_PERSONA, GLOBAL_KEYS = _load_persona_from_files(CHAR_DIR, PACK.active)  # [NEW]
     return {"ok": True, "docs": len(PACK.docs), "chars": sorted({m["char"] for m in PACK.metas})}
 
 class ChatResp(BaseModel):
