@@ -297,7 +297,7 @@ def generate_with_openai(sys_prompt: str, context: str, user: str) -> str:
 def generate_with_gemini(sys_prompt: str, context: str, user: str) -> str:
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-1.5-pro"))
+    model = genai.GenerativeModel(os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
     prompt = f"{sys_prompt}\n\n[참고 맥락]\n{context}\n\n[사용자]\n{user}"
     resp = model.generate_content(prompt)
     return resp.text
