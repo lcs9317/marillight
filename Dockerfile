@@ -24,7 +24,7 @@ RUN mkdir -p /app/cache /app/cache/hf
 # === 여기서 "빌드 타임"에 임베딩/인덱스 생성해서 이미지에 굽기 ===
 # - main.py의 build_index()를 호출해 ./cache/index.pkl + ./cache/emb_*.npy 생성
 # - 모델 파일도 HF 캐시에 받아 이미지에 포함됨(재시작 빨라짐)
-ENV CHAR_DIR=/app/characters \
+ENV CHAR_DIR=/app/character \
     USE_EMBEDDINGS=1 \
     EMB_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
     EMB_BATCH=16 \
